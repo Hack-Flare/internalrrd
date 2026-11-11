@@ -82,7 +82,7 @@ This provides consistent and reproducible deployments across all servers.
 The planned implementation uses:
 
 - Rust: Core deployment system and process management
-- Elixir: Optional central control-plane implementation
+- Odin: Optional central control-plane implementation
 - Runners: CI/CD pipelines for building and distributing application artifacts
 - Docker: Persistant application runtime environment
 
