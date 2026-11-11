@@ -14,9 +14,9 @@ The design also calls for signed deployment notifications, release tracking, hea
 
 ## Repository components
 
-- **`internalrrd/`**, Rust component intended to run on each server and manage application processes and releases. See [`internalrrd/README.md`](internalrrd/README.md).
-- **`protocol/`**. Rust component for the deployment communication protocol. See [`protocol/README.md`](protocol/README.md).
-- **`console/`**, Odin component intended for the deployment controller/console. See [`console/README.md`](console/README.md).
+- **`internalrrd/`**, Component intended to run on each server and manage application processes and releases. See [`internalrrd/README.md`](internalrrd/README.md).
+- **`protocol/`**. Component for the deployment communication protocol. See [`protocol/README.md`](protocol/README.md).
+- **`console/`**, Component intended for the deployment controller/console. See [`console/README.md`](console/README.md).
 
 ## License
 

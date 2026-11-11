@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["internalrrd", "protocol"]
+members = ["console","internalrrd", "protocol"]
 
 [workspace.lints.clippy]
 unwrap_used = "deny"

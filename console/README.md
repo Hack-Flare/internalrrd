@@ -1,3 +1,3 @@
 # Console
 
-The Odin console component of InternalRRD.
+The console component of InternalRRD.
