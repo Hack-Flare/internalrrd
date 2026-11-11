@@ -2,7 +2,7 @@
 
 ## Internal Rolling Release Deployments
 
-InternalRRD is a lightweight, application-agnostic rolling deployment system designed to manage application porcesses inside persistent Docker containers.
+InternalRRD is a lightweight, application-agnostic rolling deployment system designed to manage application porcesses inside persistent containers.
 
 Its primary goal is to enable zero-downtime application updates without restarting or replacing the container itself.
 
