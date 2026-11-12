@@ -6,8 +6,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-/// The default port used for the InternalRRD management protocol.
-pub const DEFAULT_MANAGEMENT_PORT: u16 = 54;
+pub use protocol::DEFAULT_MANAGEMENT_PORT;
 
 fn default_management_port() -> u16 {
     DEFAULT_MANAGEMENT_PORT

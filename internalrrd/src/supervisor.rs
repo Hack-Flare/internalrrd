@@ -13,6 +13,10 @@ impl InstanceId {
     fn new(value: u64) -> Self {
         Self(value)
     }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
 }
 
 impl fmt::Display for InstanceId {

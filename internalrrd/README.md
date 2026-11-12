@@ -2,6 +2,22 @@
 
 The service component of InternalRRD, an in-container rolling deployment project.
 
+## Management protocol
+
+`internalrrd` listens on TCP port `54` by default and binds to `0.0.0.0`.
+The port is configurable with `management.port`.
+Binding port `54` may require root or `CAP_NET_BIND_SERVICE` inside the container.
+
+It currently handles these protocol requests:
+
+- `Hello`: returns the application name and supported capabilities.
+- `Status`: returns the running application instances.
+- `Metrics`: returns InternalRRD, application, and per-instance metrics.
+
+Metrics currently include average process CPU usage since start, resident memory, and filesystem storage usage.
+
+The wire format and message definitions live in [`protocol/README.md`](../protocol/README.md).
+
 ## Build and run
 
 From the repository root, build or run it with:

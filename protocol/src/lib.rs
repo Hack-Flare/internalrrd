@@ -4,6 +4,9 @@ pub mod message;
 pub mod signature;
 pub mod version;
 
+/// The default TCP port used for the management protocol.
+pub const DEFAULT_MANAGEMENT_PORT: u16 = 54;
+
 pub use codec::{
     Envelope, LENGTH_PREFIX_BYTES, MAX_FRAME_PAYLOAD_BYTES, ProtocolCodec, Request, RequestCodec,
     Response, ResponseCodec,
