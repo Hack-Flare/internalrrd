@@ -1,0 +1,20 @@
+# InternalRRD service configuration.
+#
+# Defaults to port 54
+[management]
+port = 54
+
+[application]
+# A human readable name used in logs.
+name = "example"
+# The executable started for each application instance.
+command = "/usr/bin/example"
+args = ["--serve"]
+# Optional. Defaults to the working directory of internalrrd.
+working_directory = "/srv/example"
+# Seconds an instance has to exit after SIGTERM before it is killed.
+shutdown_timeout_secs = 30
+
+# Optional environment variables passed to every instance.
+[application.environment]
+RUST_LOG = "info"
