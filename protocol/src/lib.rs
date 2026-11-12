@@ -10,9 +10,10 @@ pub use codec::{
 };
 pub use error::CodecError;
 pub use message::{
-    Capability, Command, DeploymentAccepted, DeploymentRejected, HelloRequest, HelloResponse,
-    InstanceStatus, MessageBody, MessageType, Outcome, ProtocolError, ProtocolErrorCode,
-    RejectionCode, RequestId, StatusReport,
+    ApplicationMetrics, Capability, Command, ComponentMetrics, CustomMetric, DeploymentAccepted,
+    DeploymentRejected, HelloRequest, HelloResponse, InstanceMetrics, InstanceStatus, MessageBody,
+    MessageType, MetricsReport, MetricsRequest, Outcome, ProtocolError, ProtocolErrorCode,
+    RejectionCode, RequestId, ResourceMetrics, StatusReport, TrafficMetrics,
 };
 pub use signature::{
     Artifact, DEPLOYMENT_SIGNING_DOMAIN, Deployment, DeploymentSignature, SignatureAlgorithm,

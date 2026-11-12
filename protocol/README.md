@@ -46,11 +46,13 @@ Requests use the `0x00xx` range and responses use the `0x80xx` range.
 | `0x0001` | request   | Hello                | `HelloRequest`       |
 | `0x0002` | request   | Deploy               | `SignedDeployment`   |
 | `0x0003` | request   | Status               | none                 |
+| `0x0004` | request   | Metrics              | `MetricsRequest`     |
 | `0x8001` | response  | Hello                | `HelloResponse`      |
 | `0x8002` | response  | DeploymentAccepted   | `DeploymentAccepted` |
 | `0x8003` | response  | DeploymentRejected   | `DeploymentRejected` |
 | `0x8004` | response  | Status               | `StatusReport`       |
 | `0x8005` | response  | Error                | `ProtocolError`      |
+| `0x8006` | response  | Metrics              | `MetricsReport`      |
 
 A typical session is:
 
@@ -58,7 +60,7 @@ A typical session is:
 2. The server replies with `Hello` and its current deployment state.
 3. The control plane sends `Deploy` with a signed deployment notification.
 4. The server replies with `DeploymentAccepted` or `DeploymentRejected`.
-5. The control plane may query `Status` at any time.
+5. The control plane may query `Status` or `Metrics` at any time.
 
 ## Capabilities
 
@@ -68,8 +70,41 @@ Capabilities are advertised in `HelloRequest` and `HelloResponse`.
 | ----- | ------------------- |
 | `1`   | `SignedDeployments` |
 | `2`   | `StatusReporting`   |
+| `3`   | `MetricsReporting`  |
 
 Unknown capability values are preserved on the wire.
+
+## Metrics
+
+`MetricsRequest` asks the server for a metrics snapshot.
+Its optional `instance` field restricts the `instances` list to one application instance.
+
+`MetricsReport` contains:
+
+- `captured_at_unix`: the snapshot time.
+- `internalrrd`: metrics for the InternalRRD service itself.
+- `application`: application metrics, or `None` when no application is running.
+
+`ComponentMetrics` contains resource, traffic, and custom metrics.
+
+`ResourceMetrics` reports:
+
+- `cpu_basis_points`: CPU usage in basis points, where `10_000` is one fully used core.
+- `memory_used_bytes` and optional `memory_limit_bytes`.
+- `storage_used_bytes` and optional `storage_limit_bytes`.
+
+`TrafficMetrics` reports:
+
+- `total_requests`: the total request count.
+- `requests_last_24h`: the request count in the last 24 hours.
+- `average_requests_per_second_milli`: the average rate scaled by 1000.
+- `average_window_seconds`: the window used for the average.
+
+`ApplicationMetrics` includes the application name, deployed version, aggregate metrics, and per-instance metrics.
+`InstanceMetrics` includes the instance ID, PID, health, uptime, and component metrics.
+
+`CustomMetric` carries application specific values that have no typed field.
+Use it for new metrics without changing the wire format.
 
 ## Deployment signatures
 

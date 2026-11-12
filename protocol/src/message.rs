@@ -41,12 +41,14 @@ impl MessageType {
     pub const HELLO_REQUEST: Self = Self(0x0001);
     pub const DEPLOY_REQUEST: Self = Self(0x0002);
     pub const STATUS_REQUEST: Self = Self(0x0003);
+    pub const METRICS_REQUEST: Self = Self(0x0004);
 
     pub const HELLO_RESPONSE: Self = Self(0x8001);
     pub const DEPLOYMENT_ACCEPTED: Self = Self(0x8002);
     pub const DEPLOYMENT_REJECTED: Self = Self(0x8003);
     pub const STATUS_RESPONSE: Self = Self(0x8004);
     pub const ERROR_RESPONSE: Self = Self(0x8005);
+    pub const METRICS_RESPONSE: Self = Self(0x8006);
 
     pub const fn new(value: u16) -> Self {
         Self(value)
@@ -72,6 +74,7 @@ pub struct Capability(u16);
 impl Capability {
     pub const SIGNED_DEPLOYMENTS: Self = Self(1);
     pub const STATUS_REPORTING: Self = Self(2);
+    pub const METRICS_REPORTING: Self = Self(3);
 
     pub const fn new(value: u16) -> Self {
         Self(value)
@@ -168,21 +171,90 @@ pub struct StatusReport {
     pub instances: Vec<InstanceStatus>,
 }
 
+/// Requests a metrics snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetricsRequest {
+    /// When set, restrict instance metrics to this application instance.
+    pub instance: Option<u64>,
+}
+
+/// A snapshot of service and application metrics.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MetricsReport {
+    /// Unix timestamp in seconds when the snapshot was captured.
+    pub captured_at_unix: u64,
+    pub internalrrd: ComponentMetrics,
+    pub application: Option<ApplicationMetrics>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApplicationMetrics {
+    pub name: String,
+    pub deployed_version: Option<String>,
+    pub aggregate: ComponentMetrics,
+    pub instances: Vec<InstanceMetrics>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InstanceMetrics {
+    pub id: u64,
+    pub pid: u32,
+    pub healthy: bool,
+    pub uptime_secs: u64,
+    pub metrics: ComponentMetrics,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComponentMetrics {
+    pub resources: ResourceMetrics,
+    pub traffic: TrafficMetrics,
+    pub custom: Vec<CustomMetric>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceMetrics {
+    /// CPU usage in basis points, where 10_000 is one fully used core.
+    pub cpu_basis_points: u32,
+    pub memory_used_bytes: u64,
+    pub memory_limit_bytes: Option<u64>,
+    pub storage_used_bytes: u64,
+    pub storage_limit_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrafficMetrics {
+    pub total_requests: u64,
+    pub requests_last_24h: u64,
+    /// Average requests per second over the reporting window, scaled by 1000.
+    pub average_requests_per_second_milli: u64,
+    pub average_window_seconds: u32,
+}
+
+/// An application specific metric that has no typed field.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CustomMetric {
+    pub name: String,
+    pub value: f64,
+    pub unit: String,
+}
+
 /// Messages sent by the control plane to a server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
     Hello(HelloRequest),
     Deploy(SignedDeployment),
     Status,
+    Metrics(MetricsRequest),
 }
 
 /// Messages sent by a server to the control plane.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Outcome {
     Hello(HelloResponse),
     DeploymentAccepted(DeploymentAccepted),
     DeploymentRejected(DeploymentRejected),
     Status(StatusReport),
+    Metrics(Box<MetricsReport>),
     Error(ProtocolError),
 }
 
@@ -204,6 +276,7 @@ impl MessageBody for Command {
             Self::Hello(_) => MessageType::HELLO_REQUEST,
             Self::Deploy(_) => MessageType::DEPLOY_REQUEST,
             Self::Status => MessageType::STATUS_REQUEST,
+            Self::Metrics(_) => MessageType::METRICS_REQUEST,
         }
     }
 
@@ -215,7 +288,8 @@ impl MessageBody for Command {
         match message_type {
             MessageType::HELLO_REQUEST
             | MessageType::DEPLOY_REQUEST
-            | MessageType::STATUS_REQUEST => {}
+            | MessageType::STATUS_REQUEST
+            | MessageType::METRICS_REQUEST => {}
             other => return Err(CodecError::UnknownMessageType(other.raw())),
         }
 
@@ -238,6 +312,7 @@ impl MessageBody for Outcome {
             Self::DeploymentAccepted(_) => MessageType::DEPLOYMENT_ACCEPTED,
             Self::DeploymentRejected(_) => MessageType::DEPLOYMENT_REJECTED,
             Self::Status(_) => MessageType::STATUS_RESPONSE,
+            Self::Metrics(_) => MessageType::METRICS_RESPONSE,
             Self::Error(_) => MessageType::ERROR_RESPONSE,
         }
     }
@@ -252,6 +327,7 @@ impl MessageBody for Outcome {
             | MessageType::DEPLOYMENT_ACCEPTED
             | MessageType::DEPLOYMENT_REJECTED
             | MessageType::STATUS_RESPONSE
+            | MessageType::METRICS_RESPONSE
             | MessageType::ERROR_RESPONSE => {}
             other => return Err(CodecError::UnknownMessageType(other.raw())),
         }

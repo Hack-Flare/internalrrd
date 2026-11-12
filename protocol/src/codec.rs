@@ -204,7 +204,11 @@ impl<B: MessageBody> Decoder for ProtocolCodec<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::{DeploymentAccepted, HelloResponse, InstanceStatus, StatusReport};
+    use crate::message::{
+        ApplicationMetrics, ComponentMetrics, CustomMetric, DeploymentAccepted, HelloResponse,
+        InstanceMetrics, InstanceStatus, MetricsReport, MetricsRequest, ResourceMetrics,
+        StatusReport, TrafficMetrics,
+    };
     use crate::signature::{Artifact, Deployment, SignedDeployment};
 
     fn request(request_id: u64) -> Request {
@@ -230,6 +234,50 @@ mod tests {
                 key_id: "release-2026".to_string(),
                 bytes: vec![0; 64],
             },
+        }
+    }
+
+    fn component_metrics() -> ComponentMetrics {
+        ComponentMetrics {
+            resources: ResourceMetrics {
+                cpu_basis_points: 1250,
+                memory_used_bytes: 64 * 1024 * 1024,
+                memory_limit_bytes: Some(128 * 1024 * 1024),
+                storage_used_bytes: 512 * 1024 * 1024,
+                storage_limit_bytes: None,
+            },
+            traffic: TrafficMetrics {
+                total_requests: 1_000_000,
+                requests_last_24h: 50_000,
+                average_requests_per_second_milli: 1250,
+                average_window_seconds: 60,
+            },
+            custom: vec![CustomMetric {
+                name: "queue_depth".to_string(),
+                value: 3.5,
+                unit: "count".to_string(),
+            }],
+        }
+    }
+
+    fn metrics_report() -> MetricsReport {
+        let metrics = component_metrics();
+
+        MetricsReport {
+            captured_at_unix: 1_700_000_000,
+            internalrrd: metrics.clone(),
+            application: Some(ApplicationMetrics {
+                name: "example".to_string(),
+                deployed_version: Some("1.2.3".to_string()),
+                aggregate: metrics.clone(),
+                instances: vec![InstanceMetrics {
+                    id: 0,
+                    pid: 42,
+                    healthy: true,
+                    uptime_secs: 3600,
+                    metrics,
+                }],
+            }),
         }
     }
 
@@ -317,6 +365,32 @@ mod tests {
             }),
         );
         assert_eq!(Response::decode(&rejected.encode()?)?, rejected);
+        Ok(())
+    }
+
+    #[test]
+    fn roundtrips_a_metrics_request() -> Result<(), CodecError> {
+        let original: Request = Envelope::current(
+            RequestId::new(10),
+            Command::Metrics(MetricsRequest { instance: Some(3) }),
+        );
+        let frame = original.encode()?;
+        let decoded = Request::decode(&frame)?;
+
+        assert_eq!(decoded, original);
+        Ok(())
+    }
+
+    #[test]
+    fn roundtrips_a_metrics_response() -> Result<(), CodecError> {
+        let original: Response = Envelope::current(
+            RequestId::new(11),
+            Outcome::Metrics(Box::new(metrics_report())),
+        );
+        let frame = original.encode()?;
+        let decoded = Response::decode(&frame)?;
+
+        assert_eq!(decoded, original);
         Ok(())
     }
 
