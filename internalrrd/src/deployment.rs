@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 use crate::config::ApplicationConfig;
 use crate::ports::{PortAllocator, PortError};
 use crate::process::ProcessSpec;
-use crate::proxy::Proxy;
+use crate::proxy::{BackendSet, Proxy};
 use crate::release::ReleaseManager;
 use crate::supervisor::{InstanceId, Supervisor, SupervisorError};
 use crate::template::{self, TemplateError, TemplateValues};
@@ -18,6 +18,7 @@ use crate::trust::TrustStore;
 /// Coordinates releases, application instances, and the L4 proxy.
 pub struct Deployment {
     application: ApplicationConfig,
+    port_names: Vec<String>,
     trust: TrustStore,
     releases: ReleaseManager,
     proxy: Option<Arc<Proxy>>,
@@ -35,10 +36,10 @@ struct DeploymentState {
     instances: Vec<ActiveInstance>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ActiveInstance {
     id: InstanceId,
-    port: u16,
+    ports: BTreeMap<String, u16>,
 }
 
 impl Deployment {
@@ -50,8 +51,15 @@ impl Deployment {
         ports: PortAllocator,
         supervisor: Arc<Mutex<Supervisor>>,
     ) -> Self {
+        let port_names = application
+            .port_specs()
+            .into_iter()
+            .map(|(name, _)| name.to_string())
+            .collect();
+
         Self {
             application,
+            port_names,
             trust,
             releases,
             proxy,
@@ -83,45 +91,42 @@ impl Deployment {
 
         let mut state = self.state.lock().await;
         let mut instances = Vec::new();
-        let mut ports = Vec::new();
+        let mut allocations = Vec::new();
 
         for _ in 0..self.application.instances {
-            let allocated = {
-                let mut allocator = self.ports.lock().await;
-                allocator.allocate().await
-            };
-            let port = match allocated {
-                Ok(port) => port,
+            let ports = match self.allocate_ports().await {
+                Ok(ports) => ports,
                 Err(error) => {
-                    self.rollback(&mut instances, &mut ports).await;
+                    self.rollback(&mut instances, &mut allocations).await;
                     return Err(error.into());
                 }
             };
-            ports.push(port);
 
-            let spec = match self.spec_for(release.as_deref(), port) {
+            let spec = match self.spec_for(release.as_deref(), &ports) {
                 Ok(spec) => spec,
                 Err(error) => {
-                    self.rollback(&mut instances, &mut ports).await;
+                    allocations.push(ports);
+                    self.rollback(&mut instances, &mut allocations).await;
                     return Err(error);
                 }
             };
+            allocations.push(ports.clone());
 
             let started = {
                 let mut supervisor = self.supervisor.lock().await;
                 supervisor.start_with(spec)
             };
             match started {
-                Ok(id) => instances.push(ActiveInstance { id, port }),
+                Ok(id) => instances.push(ActiveInstance { id, ports }),
                 Err(error) => {
-                    self.rollback(&mut instances, &mut ports).await;
+                    self.rollback(&mut instances, &mut allocations).await;
                     return Err(error.into());
                 }
             }
         }
 
         if let Some(proxy) = &self.proxy {
-            proxy.switch(backend_addresses(&instances));
+            proxy.switch(backend_addresses(&instances, &self.port_names));
         }
         state.instances = instances;
         state.release = release;
@@ -190,50 +195,51 @@ impl Deployment {
             .map_err(|error| reject(RejectionCode::ARTIFACT_UNAVAILABLE, error))?;
 
         let mut new_instances = Vec::new();
-        let mut new_ports = Vec::new();
+        let mut new_allocations = Vec::new();
 
         for _ in 0..self.application.instances {
-            let allocated = {
-                let mut allocator = self.ports.lock().await;
-                allocator.allocate().await
-            };
-            let port = match allocated {
-                Ok(port) => port,
+            let ports = match self.allocate_ports().await {
+                Ok(ports) => ports,
                 Err(error) => {
-                    self.rollback(&mut new_instances, &mut new_ports).await;
+                    self.rollback(&mut new_instances, &mut new_allocations)
+                        .await;
                     return Err(reject(RejectionCode::INTERNAL, error));
                 }
             };
-            new_ports.push(port);
 
-            let spec = match self.spec_for(Some(&release.directory), port) {
+            let spec = match self.spec_for(Some(&release.directory), &ports) {
                 Ok(spec) => spec,
                 Err(error) => {
-                    self.rollback(&mut new_instances, &mut new_ports).await;
+                    new_allocations.push(ports);
+                    self.rollback(&mut new_instances, &mut new_allocations)
+                        .await;
                     return Err(reject(RejectionCode::INTERNAL, error));
                 }
             };
+            new_allocations.push(ports.clone());
 
             let started = {
                 let mut supervisor = self.supervisor.lock().await;
                 supervisor.start_with(spec)
             };
             match started {
-                Ok(id) => new_instances.push(ActiveInstance { id, port }),
+                Ok(id) => new_instances.push(ActiveInstance { id, ports }),
                 Err(error) => {
-                    self.rollback(&mut new_instances, &mut new_ports).await;
+                    self.rollback(&mut new_instances, &mut new_allocations)
+                        .await;
                     return Err(reject(RejectionCode::INTERNAL, error));
                 }
             }
         }
 
         if let Err(error) = self.wait_until_healthy(&new_instances).await {
-            self.rollback(&mut new_instances, &mut new_ports).await;
+            self.rollback(&mut new_instances, &mut new_allocations)
+                .await;
             return Err(reject(RejectionCode::HEALTH_CHECK_FAILED, error));
         }
 
         if let Some(proxy) = &self.proxy {
-            proxy.switch(backend_addresses(&new_instances));
+            proxy.switch(backend_addresses(&new_instances, &self.port_names));
         }
 
         let old_instances = {
@@ -259,9 +265,19 @@ impl Deployment {
         Ok(deployment.version)
     }
 
-    fn spec_for(&self, release: Option<&Path>, port: u16) -> Result<ProcessSpec, DeploymentError> {
+    async fn allocate_ports(&self) -> Result<BTreeMap<String, u16>, PortError> {
+        let mut allocator = self.ports.lock().await;
+        let ports = allocator.allocate_many(self.port_names.len()).await?;
+        Ok(self.port_names.iter().cloned().zip(ports).collect())
+    }
+
+    fn spec_for(
+        &self,
+        release: Option<&Path>,
+        ports: &BTreeMap<String, u16>,
+    ) -> Result<ProcessSpec, DeploymentError> {
         let values = TemplateValues {
-            port,
+            ports,
             release_dir: release,
         };
 
@@ -320,7 +336,11 @@ impl Deployment {
         Ok(())
     }
 
-    async fn rollback(&self, instances: &mut Vec<ActiveInstance>, ports: &mut Vec<u16>) {
+    async fn rollback(
+        &self,
+        instances: &mut Vec<ActiveInstance>,
+        allocations: &mut Vec<BTreeMap<String, u16>>,
+    ) {
         {
             let mut supervisor = self.supervisor.lock().await;
             for instance in instances.drain(..) {
@@ -335,8 +355,10 @@ impl Deployment {
         }
 
         let mut allocator = self.ports.lock().await;
-        for port in ports.drain(..) {
-            allocator.release(port);
+        for ports in allocations.drain(..) {
+            for port in ports.into_values() {
+                allocator.release(port);
+            }
         }
     }
 
@@ -356,7 +378,9 @@ impl Deployment {
 
         let mut allocator = self.ports.lock().await;
         for instance in instances {
-            allocator.release(instance.port);
+            for port in instance.ports.into_values() {
+                allocator.release(port);
+            }
         }
     }
 
@@ -373,11 +397,18 @@ impl Deployment {
     }
 }
 
-fn backend_addresses(instances: &[ActiveInstance]) -> Vec<SocketAddr> {
-    instances
-        .iter()
-        .map(|instance| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), instance.port))
-        .collect()
+fn backend_addresses(instances: &[ActiveInstance], port_names: &[String]) -> BackendSet {
+    let mut backends = BackendSet::new();
+    for name in port_names {
+        let mut addresses = Vec::with_capacity(instances.len());
+        for instance in instances {
+            if let Some(port) = instance.ports.get(name) {
+                addresses.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), *port));
+            }
+        }
+        backends.insert(name.clone(), addresses);
+    }
+    backends
 }
 
 fn reject(code: RejectionCode, error: impl std::fmt::Display) -> DeploymentRejected {
@@ -412,7 +443,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
-    use crate::config::TrustConfig;
+    use crate::config::{ApplicationPortConfig, ProxyProtocol, TrustConfig};
 
     const KEY_ID: &str = "release-2026";
 
@@ -442,7 +473,12 @@ mod tests {
         ApplicationConfig {
             name: "example".to_string(),
             command: PathBuf::from("{release_dir}/run.sh"),
-            args: Vec::new(),
+            args: vec![
+                "--dns-port".to_string(),
+                "{port:dns}".to_string(),
+                "--http-port".to_string(),
+                "{port:http}".to_string(),
+            ],
             working_directory: None,
             environment: BTreeMap::new(),
             shutdown_timeout_secs: 1,
@@ -450,6 +486,16 @@ mod tests {
             startup_grace_secs: 0,
             release_directory: directory.join("releases"),
             max_artifact_bytes: 1024 * 1024,
+            ports: vec![
+                ApplicationPortConfig {
+                    name: "dns".to_string(),
+                    protocols: vec![ProxyProtocol::Udp, ProxyProtocol::Tcp],
+                },
+                ApplicationPortConfig {
+                    name: "http".to_string(),
+                    protocols: vec![ProxyProtocol::Tcp],
+                },
+            ],
         }
     }
 

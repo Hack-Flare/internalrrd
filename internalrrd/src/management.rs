@@ -513,6 +513,7 @@ mod tests {
             startup_grace_secs: 0,
             release_directory: temporary.path().join("releases"),
             max_artifact_bytes: 1024 * 1024,
+            ports: Vec::new(),
         };
         let deployment = Arc::new(DeploymentManager::new(
             application,

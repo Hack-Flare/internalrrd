@@ -19,6 +19,11 @@ pub const DEFAULT_RELEASE_DIRECTORY: &str = "/var/lib/internalrrd/releases";
 pub const DEFAULT_MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 /// The default idle timeout for UDP proxy sessions.
 pub const DEFAULT_UDP_SESSION_TIMEOUT_SECS: u64 = 30;
+/// The name of the implicit application port used when none are configured.
+pub const DEFAULT_PORT_NAME: &str = "default";
+
+/// The protocols that the implicit application port may serve.
+const DEFAULT_PORT_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Tcp, ProxyProtocol::Udp];
 
 fn default_management_port() -> u16 {
     DEFAULT_MANAGEMENT_PORT
@@ -54,6 +59,10 @@ fn default_bind_address() -> IpAddr {
 
 fn default_signature_algorithm() -> u8 {
     1
+}
+
+fn default_backend_name() -> String {
+    DEFAULT_PORT_NAME.to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -117,9 +126,48 @@ pub struct ApplicationConfig {
     /// The maximum artifact size that will be downloaded.
     #[serde(default = "default_max_artifact_bytes")]
     pub max_artifact_bytes: u64,
+    /// Named private ports that are assigned to every application instance.
+    ///
+    /// When empty, a single port named `default` is allocated per instance.
+    #[serde(default)]
+    pub ports: Vec<ApplicationPortConfig>,
+}
+
+/// One named private port that application instances listen on.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApplicationPortConfig {
+    /// The name used in template placeholders and proxy listener backends.
+    pub name: String,
+    /// The transports the application port serves.
+    pub protocols: Vec<ProxyProtocol>,
 }
 
 impl ApplicationConfig {
+    /// The configured ports, or the implicit default port when none are configured.
+    pub fn port_specs(&self) -> Vec<(&str, &[ProxyProtocol])> {
+        if self.ports.is_empty() {
+            return vec![(DEFAULT_PORT_NAME, DEFAULT_PORT_PROTOCOLS)];
+        }
+
+        self.ports
+            .iter()
+            .map(|port| (port.name.as_str(), port.protocols.as_slice()))
+            .collect()
+    }
+
+    /// The protocols declared for an application port name.
+    pub fn port_protocols(&self, name: &str) -> Option<&[ProxyProtocol]> {
+        if self.ports.is_empty() {
+            return (name == DEFAULT_PORT_NAME).then_some(DEFAULT_PORT_PROTOCOLS);
+        }
+
+        self.ports
+            .iter()
+            .find(|port| port.name == name)
+            .map(|port| port.protocols.as_slice())
+    }
+
     /// The graceful shutdown timeout as a duration.
     pub fn shutdown_timeout(&self) -> Duration {
         Duration::from_secs(self.shutdown_timeout_secs)
@@ -187,10 +235,15 @@ pub enum ProxyProtocol {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProxyListenerConfig {
+    /// The transport this listener accepts.
     pub protocol: ProxyProtocol,
     #[serde(default = "default_bind_address")]
     pub bind: IpAddr,
+    /// The public port this listener binds.
     pub port: u16,
+    /// The application port name that supplies backends for this listener.
+    #[serde(default = "default_backend_name")]
+    pub backend: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -261,8 +314,43 @@ impl Config {
             ));
         }
 
+        self.validate_application_ports()?;
         self.validate_trust()?;
         self.validate_proxy()
+    }
+
+    fn validate_application_ports(&self) -> Result<(), ConfigError> {
+        let mut names = BTreeSet::new();
+        for port in &self.application.ports {
+            if port.name.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "application.ports[].name must not be empty".to_string(),
+                ));
+            }
+            if !names.insert(port.name.as_str()) {
+                return Err(ConfigError::Invalid(format!(
+                    "application port '{}' is defined more than once",
+                    port.name
+                )));
+            }
+            if port.protocols.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "application port '{}' must declare at least one protocol",
+                    port.name
+                )));
+            }
+
+            let mut protocols = BTreeSet::new();
+            for protocol in &port.protocols {
+                if !protocols.insert(*protocol) {
+                    return Err(ConfigError::Invalid(format!(
+                        "application port '{}' declares the {:?} protocol more than once",
+                        port.name, protocol
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn validate_trust(&self) -> Result<(), ConfigError> {
@@ -311,6 +399,23 @@ impl Config {
 
         let mut listeners = BTreeSet::new();
         for listener in &self.proxy.listeners {
+            let Some(protocols) = self.application.port_protocols(&listener.backend) else {
+                return Err(ConfigError::Invalid(format!(
+                    "proxy listener {:?} {}:{} references unknown application port '{}'",
+                    listener.protocol, listener.bind, listener.port, listener.backend
+                )));
+            };
+            if !protocols.contains(&listener.protocol) {
+                return Err(ConfigError::Invalid(format!(
+                    "proxy listener {:?} {}:{} targets application port '{}', which does not declare the {:?} protocol",
+                    listener.protocol,
+                    listener.bind,
+                    listener.port,
+                    listener.backend,
+                    listener.protocol
+                )));
+            }
+
             if listener.port == self.management.port {
                 return Err(ConfigError::Invalid(format!(
                     "proxy listener port {} conflicts with the management port",
@@ -379,6 +484,7 @@ mod tests {
                 startup_grace_secs: default_startup_grace_secs(),
                 release_directory: default_release_directory(),
                 max_artifact_bytes: default_max_artifact_bytes(),
+                ports: Vec::new(),
             },
             trust: TrustConfig::default(),
             proxy: ProxyConfig::default(),
@@ -412,6 +518,11 @@ mod tests {
         assert!(config.trust.keys.is_empty());
         assert!(config.proxy.listeners.is_empty());
         assert!(config.proxy.ports.is_none());
+        assert!(config.application.ports.is_empty());
+        assert_eq!(
+            config.application.port_specs(),
+            vec![(DEFAULT_PORT_NAME, DEFAULT_PORT_PROTOCOLS)]
+        );
         assert_eq!(
             config.proxy.udp_session_timeout_secs,
             DEFAULT_UDP_SESSION_TIMEOUT_SECS
@@ -502,6 +613,8 @@ mod tests {
         assert_eq!(config.proxy.listeners.len(), 2);
         assert_eq!(config.proxy.listeners[0].protocol, ProxyProtocol::Tcp);
         assert_eq!(config.proxy.listeners[1].protocol, ProxyProtocol::Udp);
+        assert_eq!(config.proxy.listeners[0].backend, DEFAULT_PORT_NAME);
+        assert_eq!(config.proxy.listeners[1].backend, DEFAULT_PORT_NAME);
         assert_eq!(
             config.proxy.listeners[1].bind,
             "127.0.0.1".parse::<IpAddr>()?
@@ -582,6 +695,112 @@ mod tests {
             protocol: ProxyProtocol::Tcp,
             bind: default_bind_address(),
             port: DEFAULT_MANAGEMENT_PORT,
+            backend: default_backend_name(),
+        }];
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn parses_named_application_ports() -> Result<(), Box<dyn Error>> {
+        let config: Config = toml::from_str(
+            r#"
+            [application]
+            name = "example"
+            command = "{release_dir}/bin/example"
+
+            [[application.ports]]
+            name = "dns"
+            protocols = ["udp", "tcp"]
+
+            [[application.ports]]
+            name = "http"
+            protocols = ["tcp"]
+
+            [[proxy.listeners]]
+            protocol = "udp"
+            port = 53
+            backend = "dns"
+
+            [[proxy.listeners]]
+            protocol = "tcp"
+            port = 53
+            backend = "dns"
+
+            [[proxy.listeners]]
+            protocol = "tcp"
+            port = 80
+            backend = "http"
+            "#,
+        )?;
+        config.validate()?;
+
+        assert_eq!(config.application.ports.len(), 2);
+        assert_eq!(
+            config.application.port_protocols("dns"),
+            Some(&[ProxyProtocol::Udp, ProxyProtocol::Tcp][..])
+        );
+        assert_eq!(
+            config.application.port_protocols("http"),
+            Some(&[ProxyProtocol::Tcp][..])
+        );
+        assert_eq!(config.proxy.listeners[0].backend, "dns");
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_duplicate_application_port_names() {
+        let mut config = minimal_config();
+        config.application.ports = vec![
+            ApplicationPortConfig {
+                name: "dns".to_string(),
+                protocols: vec![ProxyProtocol::Udp],
+            },
+            ApplicationPortConfig {
+                name: "dns".to_string(),
+                protocols: vec![ProxyProtocol::Tcp],
+            },
+        ];
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_application_ports_without_protocols() {
+        let mut config = minimal_config();
+        config.application.ports = vec![ApplicationPortConfig {
+            name: "dns".to_string(),
+            protocols: Vec::new(),
+        }];
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_listener_backends() {
+        let mut config = minimal_config();
+        config.proxy.listeners = vec![ProxyListenerConfig {
+            protocol: ProxyProtocol::Tcp,
+            bind: default_bind_address(),
+            port: 8080,
+            backend: "missing".to_string(),
+        }];
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_listeners_with_an_undeclared_protocol() {
+        let mut config = minimal_config();
+        config.application.ports = vec![ApplicationPortConfig {
+            name: "ntp".to_string(),
+            protocols: vec![ProxyProtocol::Udp],
+        }];
+        config.proxy.listeners = vec![ProxyListenerConfig {
+            protocol: ProxyProtocol::Tcp,
+            bind: default_bind_address(),
+            port: 123,
+            backend: "ntp".to_string(),
         }];
 
         assert!(config.validate().is_err());
@@ -605,7 +824,9 @@ mod tests {
 
         assert_eq!(config.application.name, "example");
         assert_eq!(config.application.instances, 2);
-        assert_eq!(config.proxy.listeners.len(), 2);
+        assert_eq!(config.application.ports.len(), 4);
+        assert_eq!(config.proxy.listeners.len(), 5);
+        assert_eq!(config.proxy.listeners[0].backend, "ntp");
         Ok(())
     }
 

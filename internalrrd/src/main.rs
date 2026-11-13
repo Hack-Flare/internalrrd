@@ -136,6 +136,7 @@ async fn start_proxy(config: &Config) -> Result<Option<Arc<Proxy>>, Box<dyn Erro
             },
             bind: listener.bind,
             port: listener.port,
+            backend: listener.backend.clone(),
         })
         .collect();
     let timeout = Duration::from_secs(config.proxy.udp_session_timeout_secs);

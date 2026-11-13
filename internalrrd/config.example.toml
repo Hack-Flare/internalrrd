@@ -1,6 +1,6 @@
 # InternalRRD service configuration.
 #
-# Defaults to port 54.
+# The management protocol listens on TCP port 54 by default.
 [management]
 port = 54
 
@@ -9,8 +9,13 @@ port = 54
 name = "example"
 # The entrypoint template inside an extracted release.
 command = "{release_dir}/bin/example"
-# Arguments support {port}, {address}, {listen_address}, and {release_dir}.
-args = ["--listen", "{listen_address}"]
+# Every argument is a template. Named placeholders select one application port.
+args = [
+  "--ntp-port", "{port:ntp}",
+  "--dns-port", "{port:dns}",
+  "--http-port", "{port:http}",
+  "--https-port", "{port:https}",
+]
 # Optional. Defaults to the release directory when a release is active.
 working_directory = "{release_dir}"
 # Seconds an instance has to exit after SIGTERM before it is killed.
@@ -27,7 +32,29 @@ max_artifact_bytes = 536870912
 # Optional environment variables passed to every instance.
 [application.environment]
 RUST_LOG = "info"
-LISTEN_ADDR = "{listen_address}"
+NTP_LISTEN_ADDR = "{listen_address:ntp}"
+DNS_LISTEN_ADDR = "{listen_address:dns}"
+HTTP_LISTEN_ADDR = "{listen_address:http}"
+HTTPS_LISTEN_ADDR = "{listen_address:https}"
+
+# Named private ports. Each instance receives one private port per entry.
+# The declared protocols are the transports that may reach the port through the proxy.
+[[application.ports]]
+name = "ntp"
+protocols = ["udp"]
+
+# A single private port can serve both UDP and TCP, which is required for DNS.
+[[application.ports]]
+name = "dns"
+protocols = ["udp", "tcp"]
+
+[[application.ports]]
+name = "http"
+protocols = ["tcp"]
+
+[[application.ports]]
+name = "https"
+protocols = ["tcp"]
 
 [trust]
 # Release signing keys. Ed25519 public keys are 64 hexadecimal characters.
@@ -45,14 +72,34 @@ udp_session_timeout_secs = 30
 start = 30000
 end = 31000
 
-# Public L4 listeners that forward to the active release.
-# Remove all listener entries to run without a proxy.
+# Public L4 listeners. Each listener forwards to one named application port.
+# TCP and UDP listeners may share a public port number.
 [[proxy.listeners]]
-protocol = "tcp"
+protocol = "udp"
 bind = "0.0.0.0"
-port = 8080
+port = 123
+backend = "ntp"
 
 [[proxy.listeners]]
 protocol = "udp"
 bind = "0.0.0.0"
 port = 53
+backend = "dns"
+
+[[proxy.listeners]]
+protocol = "tcp"
+bind = "0.0.0.0"
+port = 53
+backend = "dns"
+
+[[proxy.listeners]]
+protocol = "tcp"
+bind = "0.0.0.0"
+port = 80
+backend = "http"
+
+[[proxy.listeners]]
+protocol = "tcp"
+bind = "0.0.0.0"
+port = 443
+backend = "https"

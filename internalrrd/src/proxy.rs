@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -13,6 +13,9 @@ use tokio::task::JoinHandle;
 const UDP_BUFFER_BYTES: usize = 65_535;
 const UDP_SESSION_QUEUE: usize = 16;
 
+/// Backend addresses for every configured application port name.
+pub type BackendSet = BTreeMap<String, Vec<SocketAddr>>;
+
 /// The transport a public listener accepts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
@@ -26,6 +29,8 @@ pub struct ListenerSpec {
     pub transport: Transport,
     pub bind: IpAddr,
     pub port: u16,
+    /// The application port name that supplies backends for this listener.
+    pub backend: String,
 }
 
 /// An L4 proxy whose backends can be switched atomically.
@@ -33,7 +38,7 @@ pub struct ListenerSpec {
 /// TCP connections and UDP sessions that are already open keep using the backend hey started with.
 /// New connections and sessions use the latest backend set.
 pub struct Proxy {
-    backends: watch::Sender<Arc<Vec<SocketAddr>>>,
+    backends: watch::Sender<Arc<BackendSet>>,
     listeners: Vec<BoundListener>,
 }
 
@@ -48,7 +53,7 @@ impl Proxy {
         specs: &[ListenerSpec],
         udp_session_timeout: Duration,
     ) -> Result<Self, ProxyError> {
-        let (backends, receiver) = watch::channel(Arc::new(Vec::new()));
+        let (backends, receiver) = watch::channel(Arc::new(BackendSet::new()));
         let mut listeners = Vec::with_capacity(specs.len());
 
         for spec in specs {
@@ -66,7 +71,8 @@ impl Proxy {
                         address: requested,
                         source,
                     })?;
-                    let task = tokio::spawn(serve_tcp(listener, receiver.clone()));
+                    let task =
+                        tokio::spawn(serve_tcp(listener, receiver.clone(), spec.backend.clone()));
                     (address, task)
                 }
                 Transport::Udp => {
@@ -80,8 +86,12 @@ impl Proxy {
                         address: requested,
                         source,
                     })?;
-                    let task =
-                        tokio::spawn(serve_udp(socket, receiver.clone(), udp_session_timeout));
+                    let task = tokio::spawn(serve_udp(
+                        socket,
+                        receiver.clone(),
+                        spec.backend.clone(),
+                        udp_session_timeout,
+                    ));
                     (address, task)
                 }
             };
@@ -96,7 +106,7 @@ impl Proxy {
     }
 
     /// Replace the backend set used for new connections and sessions.
-    pub fn switch(&self, backends: Vec<SocketAddr>) {
+    pub fn switch(&self, backends: BackendSet) {
         if self.backends.send(Arc::new(backends)).is_err() {
             tracing::warn!("proxy has no active listeners to switch");
         }
@@ -116,7 +126,11 @@ impl Drop for Proxy {
     }
 }
 
-async fn serve_tcp(listener: TcpListener, backends: watch::Receiver<Arc<Vec<SocketAddr>>>) {
+async fn serve_tcp(
+    listener: TcpListener,
+    backends: watch::Receiver<Arc<BackendSet>>,
+    port_name: String,
+) {
     let counter = AtomicUsize::new(0);
 
     loop {
@@ -129,8 +143,9 @@ async fn serve_tcp(listener: TcpListener, backends: watch::Receiver<Arc<Vec<Sock
         };
 
         let current = backends.borrow().clone();
-        let Some(backend) = pick(&current, &counter) else {
-            tracing::warn!(%peer, "no backend available for TCP connection");
+        let candidates = current.get(&port_name).map(Vec::as_slice).unwrap_or(&[]);
+        let Some(backend) = pick(candidates, &counter) else {
+            tracing::warn!(%peer, port = %port_name, "no backend available for TCP connection");
             continue;
         };
 
@@ -158,7 +173,8 @@ async fn serve_tcp(listener: TcpListener, backends: watch::Receiver<Arc<Vec<Sock
 
 async fn serve_udp(
     socket: Arc<UdpSocket>,
-    backends: watch::Receiver<Arc<Vec<SocketAddr>>>,
+    backends: watch::Receiver<Arc<BackendSet>>,
+    port_name: String,
     idle_timeout: Duration,
 ) {
     let counter = AtomicUsize::new(0);
@@ -185,8 +201,10 @@ async fn serve_udp(
                         Some(sender) if !sender.is_closed() => sender.clone(),
                         _ => {
                             let current = backends.borrow().clone();
-                            let Some(backend) = pick(&current, &counter) else {
-                                tracing::warn!(%client, "no backend available for UDP session");
+                            let candidates =
+                                current.get(&port_name).map(Vec::as_slice).unwrap_or(&[]);
+                            let Some(backend) = pick(candidates, &counter) else {
+                                tracing::warn!(%client, port = %port_name, "no backend available for UDP session");
                                 continue;
                             };
                             let (sender, receiver) = mpsc::channel(UDP_SESSION_QUEUE);
@@ -318,6 +336,7 @@ mod tests {
                 transport: Transport::Tcp,
                 bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
                 port: 0,
+                backend: "default".to_string(),
             }],
             Duration::from_secs(1),
         )
@@ -326,7 +345,10 @@ mod tests {
             .addresses()
             .next()
             .ok_or("proxy did not bind a listener")?;
-        proxy.switch(vec![backend_address]);
+        proxy.switch(BTreeMap::from([(
+            "default".to_string(),
+            vec![backend_address],
+        )]));
 
         let mut client = TcpStream::connect(front).await?;
         client.write_all(b"ping").await?;
@@ -354,6 +376,7 @@ mod tests {
                 transport: Transport::Udp,
                 bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
                 port: 0,
+                backend: "default".to_string(),
             }],
             Duration::from_secs(1),
         )
@@ -362,7 +385,10 @@ mod tests {
             .addresses()
             .next()
             .ok_or("proxy did not bind a listener")?;
-        proxy.switch(vec![backend_address]);
+        proxy.switch(BTreeMap::from([(
+            "default".to_string(),
+            vec![backend_address],
+        )]));
 
         let client = UdpSocket::bind(local(0)).await?;
         client.send_to(b"ping", front).await?;

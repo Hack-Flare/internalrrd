@@ -30,6 +30,30 @@ impl PortAllocator {
 
     /// Allocate a free port and reserve it until it is released.
     pub async fn allocate(&mut self) -> Result<u16, PortError> {
+        let allocated = self.allocate_many(1).await?;
+        allocated.into_iter().next().ok_or(PortError::Exhausted)
+    }
+
+    /// Allocate `count` distinct free ports and reserve them until they are released.
+    ///
+    /// When any allocation fails, the ports allocated so far are released again.
+    pub async fn allocate_many(&mut self, count: usize) -> Result<Vec<u16>, PortError> {
+        let mut allocated = Vec::with_capacity(count);
+        for _ in 0..count {
+            match self.allocate_one().await {
+                Ok(port) => allocated.push(port),
+                Err(error) => {
+                    for port in allocated.drain(..) {
+                        self.release(port);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(allocated)
+    }
+
+    async fn allocate_one(&mut self) -> Result<u16, PortError> {
         match self.range {
             Some((start, end)) => {
                 for port in start..=end {
@@ -102,6 +126,21 @@ mod tests {
         assert_ne!(first, second);
         assert!(first > 0);
         assert!(second > 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn allocates_multiple_distinct_ports() -> Result<(), Box<dyn Error>> {
+        let range = PortRangeConfig {
+            start: 40010,
+            end: 40012,
+        };
+        let mut allocator = PortAllocator::new(Some(&range), []);
+
+        let ports = allocator.allocate_many(3).await?;
+
+        assert_eq!(ports, vec![40010, 40011, 40012]);
+        assert!(allocator.allocate().await.is_err());
         Ok(())
     }
 

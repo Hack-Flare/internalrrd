@@ -12,8 +12,9 @@ It currently supports:
 - Downloading artifacts over HTTP, HTTPS, or `file://`.
 - Verifying artifact SHA-256 checksums.
 - Extracting `tar.gz` releases into versioned directories.
-- Starting multiple instances per release on private ports.
+- Starting multiple instances per release on named private ports.
 - Switching TCP and UDP traffic to a new release without restarting the container.
+- Routing each public listener to a different application port.
 - Gracefully stopping the previous release after the switch.
 
 ## Management protocol
@@ -42,37 +43,46 @@ A `Deploy` request is processed in this order:
 5. Download the artifact and enforce `application.max_artifact_bytes`.
 6. Verify the artifact SHA-256 and size.
 7. Extract the `tar.gz` artifact into `releases/<version>-<sha12>/`.
-8. Start `application.instances` new processes on free private ports.
+8. Start `application.instances` new processes with a private port for every `application.ports` entry.
 9. Wait for `application.startup_grace_secs` and confirm the new processes are still alive.
-10. Switch the proxy to the new instance ports.
+10. Switch the proxy backend map so every listener uses the new instances.
 11. Stop the old instances with `SIGTERM`, then `SIGKILL` after the shutdown timeout.
-12. Update the `current` release link.
+12. Release the old private ports and update the `current` release link.
 
 If a new instance exits during the startup grace period, the deployment is rejected, the new instances are stopped, their ports are released, and the old release keeps serving.
 
 ## L4 proxy
 
-Each `proxy.listeners` entry binds a public TCP or UDP port and forwards it to the active release.
+Each `proxy.listeners` entry binds a public TCP or UDP port and forwards it to one named application port.
+The listener `backend` selects the name, with `default` used when it is omitted.
 
-- TCP connections are distributed round-robin across the release instances.
+- TCP connections are distributed round-robin across the instances of that application port.
 - TCP connections that are already open continue to the old release until they close.
 - UDP sessions are tracked per client address and distributed round-robin.
 - UDP sessions expire after `proxy.udp_session_timeout_secs`.
 - New TCP connections and UDP sessions use the new release immediately after the switch.
 
-Backends are always `127.0.0.1:<instance port>`.
-Applications receive their private port through placeholders in `application.args` and `application.environment`.
+Backends are always `127.0.0.1:<private port>`.
+Applications receive their private ports through placeholders in `application.command`, `application.args`, and `application.environment`.
+A named port can serve both TCP and UDP on the same private port number, which DNS requires.
 
 ## Command templates
 
 The following placeholders are expanded for every instance:
 
-| Placeholder        | Value                                  |
-| ------------------ | -------------------------------------- |
-| `{port}`           | The private instance port.             |
-| `{address}`        | `127.0.0.1`.                           |
-| `{listen_address}` | `127.0.0.1:<port>`.                    |
-| `{release_dir}`    | The extracted release directory.       |
+| Placeholder             | Value                                           |
+| ----------------------- | ----------------------------------------------- |
+| `{port}`                | The private `default` port.                     |
+| `{address}`             | `127.0.0.1`.                                    |
+| `{listen_address}`      | `127.0.0.1:<default port>`.                     |
+| `{port:name}`           | The private port of the named application port. |
+| `{address:name}`        | `127.0.0.1`, after checking the name exists.    |
+| `{listen_address:name}` | `127.0.0.1:<named port>`.                       |
+| `{release_dir}`         | The extracted release directory.                |
+
+The unnamed forms resolve to the application port named `default`.
+With multiple application ports, use the named forms.
+See [`CONFIG.md`](CONFIG.md#template-placeholders) for the complete rules.
 
 `{release_dir}` is available for deployments.
 When `application.command` contains `{release_dir}` and no release is installed, `internalrrd` starts no instances and waits for the first deployment.
@@ -126,61 +136,16 @@ The default configuration path is `/etc/internalrrd/config.toml`.
 
 ## Configuration
 
-See [`config.example.toml`](config.example.toml) for a complete example.
+[`CONFIG.md`](CONFIG.md) is the complete reference for every field, default, validation rule, and placeholder.
+[`config.example.toml`](config.example.toml) contains a working multi-port configuration for NTP, DNS, HTTP, and HTTPS.
 
-```toml
-[management]
-port = 54
+In short:
 
-[application]
-name = "example"
-command = "{release_dir}/bin/example"
-args = ["--listen", "{listen_address}"]
-working_directory = "{release_dir}"
-shutdown_timeout_secs = 30
-instances = 2
-startup_grace_secs = 2
-release_directory = "/var/lib/internalrrd/releases"
-max_artifact_bytes = 536870912
-
-[application.environment]
-LISTEN_ADDR = "{listen_address}"
-
-[trust]
-keys = [
-  { id = "release-2026", algorithm = 1, public_key = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a" },
-]
-
-[proxy]
-udp_session_timeout_secs = 30
-
-[proxy.ports]
-start = 30000
-end = 31000
-
-[[proxy.listeners]]
-protocol = "tcp"
-bind = "0.0.0.0"
-port = 8080
-
-[[proxy.listeners]]
-protocol = "udp"
-bind = "0.0.0.0"
-port = 53
-```
-
-- `management.port` is the port reserved for the management protocol and defaults to `54`.
-- `application.name` is used in logs and must match the deployment application name.
-- `application.command` is the executable or entrypoint template for each instance.
-- `application.args` are optional arguments passed to the executable.
-- `application.working_directory` is optional and defaults to the release directory when a release is active.
-- `application.environment` holds optional environment variables passed to every instance.
-- `application.shutdown_timeout_secs` controls how long an instance has to exit after `SIGTERM` before it is killed.
-- `application.instances` is the number of instances started per release and defaults to `1`.
-- `application.startup_grace_secs` is how long new instances must stay alive before traffic switches and defaults to `2`.
-- `application.release_directory` is where artifacts and releases are stored.
-- `application.max_artifact_bytes` limits downloaded artifact size and defaults to 512 MiB.
+- `management.port` is the management protocol port and defaults to `54`.
+- `application.name` must match the deployment application name.
+- `application.command` is the entrypoint template for each instance.
+- `application.ports` declares the named private ports that every instance receives.
 - `trust.keys` lists trusted release signing keys.
-- `proxy.listeners` defines public TCP and UDP listeners.
-- `proxy.ports` defines the private instance port range; ephemeral ports are used when absent.
+- `proxy.listeners` maps public TCP and UDP ports to named application ports.
+- `proxy.ports` defines the private port range; ephemeral ports are used when absent.
 - `proxy.udp_session_timeout_secs` controls UDP session expiry.
