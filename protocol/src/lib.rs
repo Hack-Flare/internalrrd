@@ -11,6 +11,7 @@ pub use codec::{
     Envelope, LENGTH_PREFIX_BYTES, MAX_FRAME_PAYLOAD_BYTES, ProtocolCodec, Request, RequestCodec,
     Response, ResponseCodec,
 };
+pub use ed25519_dalek::{SigningKey, VerifyingKey};
 pub use error::CodecError;
 pub use message::{
     ApplicationMetrics, Capability, Command, ComponentMetrics, CustomMetric, DeploymentAccepted,

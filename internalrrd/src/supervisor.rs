@@ -52,26 +52,21 @@ pub enum SupervisorError {
 }
 
 /// Owns application instances and their lifecycle.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Supervisor {
-    spec: ProcessSpec,
     next_id: u64,
     instances: BTreeMap<InstanceId, ManagedProcess>,
 }
 
 impl Supervisor {
-    pub fn new(spec: ProcessSpec) -> Self {
-        Self {
-            spec,
-            next_id: 0,
-            instances: BTreeMap::new(),
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// Start a new application instance and track it.
-    pub fn start(&mut self) -> Result<InstanceId, SupervisorError> {
+    /// Start a new application instance from a fully resolved process spec.
+    pub fn start_with(&mut self, spec: ProcessSpec) -> Result<InstanceId, SupervisorError> {
         let id = InstanceId::new(self.next_id);
-        let process = ManagedProcess::spawn(id, &self.spec)?;
+        let process = ManagedProcess::spawn(id, &spec)?;
         self.next_id = self
             .next_id
             .checked_add(1)
@@ -80,13 +75,13 @@ impl Supervisor {
         Ok(id)
     }
 
-    /// Stop one instance, waiting up to the configured shutdown timeout.
+    /// Stop one instance, waiting up to its configured shutdown timeout.
     pub async fn stop(&mut self, id: InstanceId) -> Result<(), SupervisorError> {
         let mut process = self
             .instances
             .remove(&id)
             .ok_or(SupervisorError::UnknownInstance(id))?;
-        process.terminate(self.spec.shutdown_timeout).await?;
+        process.terminate().await?;
         Ok(())
     }
 
@@ -168,10 +163,10 @@ mod tests {
 
     #[tokio::test]
     async fn starts_and_stops_instances() -> Result<(), Box<dyn Error>> {
-        let mut supervisor = Supervisor::new(sleeping_spec());
+        let mut supervisor = Supervisor::new();
 
-        let first = supervisor.start()?;
-        let second = supervisor.start()?;
+        let first = supervisor.start_with(sleeping_spec())?;
+        let second = supervisor.start_with(sleeping_spec())?;
 
         assert_ne!(first, second);
         assert_eq!(supervisor.running().len(), 2);
@@ -186,8 +181,8 @@ mod tests {
 
     #[tokio::test]
     async fn reports_unknown_instances() -> Result<(), Box<dyn Error>> {
-        let mut supervisor = Supervisor::new(sleeping_spec());
-        let id = supervisor.start()?;
+        let mut supervisor = Supervisor::new();
+        let id = supervisor.start_with(sleeping_spec())?;
 
         supervisor.stop(id).await?;
 
@@ -204,8 +199,8 @@ mod tests {
             environment: BTreeMap::new(),
             shutdown_timeout: Duration::from_secs(5),
         };
-        let mut supervisor = Supervisor::new(spec);
-        let id = supervisor.start()?;
+        let mut supervisor = Supervisor::new();
+        let id = supervisor.start_with(spec)?;
 
         let mut exited = Vec::new();
         for _ in 0..50 {

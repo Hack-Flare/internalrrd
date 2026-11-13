@@ -13,6 +13,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
+use crate::deployment::Deployment;
 use crate::metrics;
 use crate::supervisor::Supervisor;
 
@@ -21,6 +22,7 @@ use crate::supervisor::Supervisor;
 pub struct ManagementContext {
     application: Arc<ApplicationInfo>,
     supervisor: Arc<Mutex<Supervisor>>,
+    deployment: Option<Arc<Deployment>>,
 }
 
 struct ApplicationInfo {
@@ -40,15 +42,40 @@ impl ManagementContext {
                 working_directory,
             }),
             supervisor,
+            deployment: None,
         }
+    }
+
+    pub fn with_deployment(mut self, deployment: Arc<Deployment>) -> Self {
+        self.deployment = Some(deployment);
+        self
     }
 
     fn application_name(&self) -> &str {
         &self.application.name
     }
 
-    fn working_directory(&self) -> Option<&Path> {
+    fn configured_working_directory(&self) -> Option<&Path> {
         self.application.working_directory.as_deref()
+    }
+
+    async fn current_version(&self) -> Option<String> {
+        match &self.deployment {
+            Some(deployment) => deployment.current_version().await,
+            None => None,
+        }
+    }
+
+    async fn active_working_directory(&self) -> Option<PathBuf> {
+        if let Some(deployment) = &self.deployment {
+            if let Some(release) = deployment.current_release().await {
+                return Some(release);
+            }
+            if let Some(directory) = deployment.configured_working_directory() {
+                return Some(directory.to_path_buf());
+            }
+        }
+        self.configured_working_directory().map(Path::to_path_buf)
     }
 }
 
@@ -90,10 +117,10 @@ async fn handle_request(request: Request, context: &ManagementContext) -> Respon
 
     let outcome = if version.is_compatible(ProtocolVersion::CURRENT) {
         match request.body {
-            Command::Hello(hello) => handle_hello(hello, context),
+            Command::Hello(hello) => handle_hello(hello, context).await,
             Command::Status => handle_status(context).await,
             Command::Metrics(metrics_request) => handle_metrics(metrics_request, context).await,
-            Command::Deploy(deployment) => handle_deploy(deployment),
+            Command::Deploy(deployment) => handle_deploy(deployment, context).await,
         }
     } else {
         Outcome::Error(ProtocolError {
@@ -105,11 +132,15 @@ async fn handle_request(request: Request, context: &ManagementContext) -> Respon
     Response::new(version, request_id, outcome)
 }
 
-fn handle_hello(_request: HelloRequest, context: &ManagementContext) -> Outcome {
+async fn handle_hello(_request: HelloRequest, context: &ManagementContext) -> Outcome {
     Outcome::Hello(HelloResponse {
         application: context.application_name().to_string(),
-        capabilities: vec![Capability::STATUS_REPORTING, Capability::METRICS_REPORTING],
-        deployed_version: None,
+        capabilities: vec![
+            Capability::SIGNED_DEPLOYMENTS,
+            Capability::STATUS_REPORTING,
+            Capability::METRICS_REPORTING,
+        ],
+        deployed_version: context.current_version().await,
     })
 }
 
@@ -118,10 +149,11 @@ async fn handle_status(context: &ManagementContext) -> Outcome {
         Ok(instances) => instances,
         Err(error) => return protocol_error(error),
     };
+    let deployed_version = context.current_version().await;
 
     Outcome::Status(StatusReport {
         application: context.application_name().to_string(),
-        deployed_version: None,
+        deployed_version,
         instances: instances
             .into_iter()
             .map(|instance| InstanceStatus {
@@ -141,11 +173,13 @@ async fn handle_metrics(request: MetricsRequest, context: &ManagementContext) ->
     };
 
     let application_name = context.application_name().to_string();
-    let working_directory = context.working_directory().map(Path::to_path_buf);
+    let working_directory = context.active_working_directory().await;
+    let deployed_version = context.current_version().await;
     let instance = request.instance;
     let result = tokio::task::spawn_blocking(move || {
         metrics::collect(
             &application_name,
+            deployed_version,
             working_directory.as_deref(),
             &instances,
             instance,
@@ -159,17 +193,20 @@ async fn handle_metrics(request: MetricsRequest, context: &ManagementContext) ->
     }
 }
 
-fn handle_deploy(deployment: SignedDeployment) -> Outcome {
+async fn handle_deploy(signed: SignedDeployment, context: &ManagementContext) -> Outcome {
     tracing::info!(
-        application = %deployment.deployment.application,
-        version = %deployment.deployment.version,
-        "received a deployment notification, but deployment handling is not implemented"
+        application = %signed.deployment.application,
+        version = %signed.deployment.version,
+        "received a deployment"
     );
 
-    Outcome::DeploymentRejected(DeploymentRejected {
-        code: RejectionCode::INTERNAL,
-        message: "deployment handling is not implemented yet".to_string(),
-    })
+    match &context.deployment {
+        Some(deployment) => deployment.deploy(signed).await,
+        None => Outcome::DeploymentRejected(DeploymentRejected {
+            code: RejectionCode::INTERNAL,
+            message: "deployment handling is not configured".to_string(),
+        }),
+    }
 }
 
 async fn refresh_instances(
@@ -222,24 +259,33 @@ impl Encoder<Response> for ServerCodec {
 mod tests {
     use std::collections::BTreeMap;
     use std::error::Error;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::Duration;
 
     use bytes::BytesMut;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
     use futures_util::{SinkExt, StreamExt};
     use protocol::{
         Artifact, Capability, CodecError, Command, Deployment, DeploymentSignature, HelloRequest,
         MetricsRequest, Outcome, ProtocolErrorCode, ProtocolVersion, RejectionCode, Request,
         RequestCodec, RequestId, Response, ResponseCodec, SignatureAlgorithm, SignedDeployment,
+        SigningKey,
     };
+    use sha2::{Digest, Sha256};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::Mutex;
     use tokio_util::codec::{Decoder, Encoder, Framed};
 
     use super::{ManagementContext, serve};
+    use crate::config::{ApplicationConfig, TrustConfig, TrustedKeyConfig};
+    use crate::deployment::Deployment as DeploymentManager;
+    use crate::ports::PortAllocator;
     use crate::process::ProcessSpec;
+    use crate::release::ReleaseManager;
     use crate::supervisor::Supervisor;
+    use crate::trust::TrustStore;
 
     #[derive(Default)]
     struct ClientCodec {
@@ -314,8 +360,8 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
         let address = listener.local_addr()?;
 
-        let supervisor = Arc::new(Mutex::new(Supervisor::new(sleeping_spec())));
-        let instance = supervisor.lock().await.start()?;
+        let supervisor = Arc::new(Mutex::new(Supervisor::new()));
+        let instance = supervisor.lock().await.start_with(sleeping_spec())?;
         let context = ManagementContext::new("example", None, supervisor.clone());
         let server = tokio::spawn(serve(listener, context));
 
@@ -335,6 +381,11 @@ mod tests {
         match hello.body {
             Outcome::Hello(response) => {
                 assert_eq!(response.application, "example");
+                assert!(
+                    response
+                        .capabilities
+                        .contains(&Capability::SIGNED_DEPLOYMENTS)
+                );
                 assert!(
                     response
                         .capabilities
@@ -405,6 +456,138 @@ mod tests {
                 assert_eq!(response.code, ProtocolErrorCode::UNSUPPORTED_VERSION);
             }
             _ => panic!("unexpected incompatible version response"),
+        }
+
+        server.abort();
+        supervisor.lock().await.stop_all().await?;
+        Ok(())
+    }
+
+    fn create_release_artifact(
+        directory: &Path,
+    ) -> Result<(PathBuf, [u8; 32], u64), Box<dyn Error>> {
+        let archive_path = directory.join("example.tar.gz");
+        let file = std::fs::File::create(&archive_path)?;
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+
+        let contents = b"#!/bin/sh\nexec sleep 30\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder.append_data(&mut header, "run.sh", &contents[..])?;
+        builder.finish()?;
+
+        let encoder = builder.into_inner()?;
+        encoder.finish()?;
+
+        let bytes = std::fs::read(&archive_path)?;
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        Ok((archive_path, digest, bytes.len() as u64))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn deploys_through_the_management_protocol() -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::tempdir()?;
+        let (archive, digest, size) = create_release_artifact(temporary.path())?;
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let trust = TrustStore::from_config(&TrustConfig {
+            keys: vec![TrustedKeyConfig {
+                id: "release-2026".to_string(),
+                algorithm: 1,
+                public_key: hex::encode(signing_key.verifying_key().to_bytes()),
+            }],
+        })?;
+
+        let supervisor = Arc::new(Mutex::new(Supervisor::new()));
+        let application = ApplicationConfig {
+            name: "example".to_string(),
+            command: PathBuf::from("{release_dir}/run.sh"),
+            args: Vec::new(),
+            working_directory: None,
+            environment: BTreeMap::new(),
+            shutdown_timeout_secs: 1,
+            instances: 1,
+            startup_grace_secs: 0,
+            release_directory: temporary.path().join("releases"),
+            max_artifact_bytes: 1024 * 1024,
+        };
+        let deployment = Arc::new(DeploymentManager::new(
+            application,
+            trust,
+            ReleaseManager::new(temporary.path().join("releases"), 1024 * 1024)?,
+            None,
+            PortAllocator::new(None, []),
+            supervisor.clone(),
+        ));
+        deployment.start_initial().await?;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let address = listener.local_addr()?;
+        let context = ManagementContext::new("example", None, supervisor.clone())
+            .with_deployment(deployment.clone());
+        let server = tokio::spawn(serve(listener, context));
+
+        let stream = TcpStream::connect(address).await?;
+        let mut client = Framed::new(stream, ClientCodec::default());
+
+        let signed = SignedDeployment::sign(
+            Deployment {
+                application: "example".to_string(),
+                version: "1.2.3".to_string(),
+                artifact: Artifact {
+                    url: format!("file://{}", archive.display()),
+                    sha256: digest,
+                    size_bytes: size,
+                },
+                issued_at_unix: 1_700_000_000,
+            },
+            "release-2026",
+            &signing_key,
+        )?;
+
+        let deploy = send(
+            &mut client,
+            Request::current(RequestId::new(1), Command::Deploy(signed)),
+        )
+        .await?;
+        match deploy.body {
+            Outcome::DeploymentAccepted(accepted) => assert_eq!(accepted.version, "1.2.3"),
+            other => panic!("unexpected deployment response: {other:?}"),
+        }
+
+        let status = send(
+            &mut client,
+            Request::current(RequestId::new(2), Command::Status),
+        )
+        .await?;
+        match status.body {
+            Outcome::Status(response) => {
+                assert_eq!(response.deployed_version.as_deref(), Some("1.2.3"));
+                assert_eq!(response.instances.len(), 1);
+            }
+            other => panic!("unexpected status response: {other:?}"),
+        }
+
+        let metrics = send(
+            &mut client,
+            Request::current(
+                RequestId::new(3),
+                Command::Metrics(MetricsRequest { instance: None }),
+            ),
+        )
+        .await?;
+        match metrics.body {
+            Outcome::Metrics(response) => {
+                let application = response
+                    .application
+                    .ok_or("application metrics were not reported")?;
+                assert_eq!(application.deployed_version.as_deref(), Some("1.2.3"));
+                assert_eq!(application.instances.len(), 1);
+            }
+            other => panic!("unexpected metrics response: {other:?}"),
         }
 
         server.abort();

@@ -8,11 +8,16 @@ repository.workspace = true
 [dependencies]
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
+flate2 = "1"
 futures-util = { version = "0.3", features = ["sink"] }
+hex = "0.4"
 protocol = { path = "../protocol" }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+tar = "0.4"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 toml = "0.8"
 tracing = "0.1"
@@ -20,6 +25,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true

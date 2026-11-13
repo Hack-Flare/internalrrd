@@ -1,20 +1,58 @@
 # InternalRRD service configuration.
 #
-# Defaults to port 54
+# Defaults to port 54.
 [management]
 port = 54
 
 [application]
-# A human readable name used in logs.
+# A human readable name used in logs and deployment checks.
 name = "example"
-# The executable started for each application instance.
-command = "/usr/bin/example"
-args = ["--serve"]
-# Optional. Defaults to the working directory of internalrrd.
-working_directory = "/srv/example"
+# The entrypoint template inside an extracted release.
+command = "{release_dir}/bin/example"
+# Arguments support {port}, {address}, {listen_address}, and {release_dir}.
+args = ["--listen", "{listen_address}"]
+# Optional. Defaults to the release directory when a release is active.
+working_directory = "{release_dir}"
 # Seconds an instance has to exit after SIGTERM before it is killed.
 shutdown_timeout_secs = 30
+# Instances started for each release.
+instances = 2
+# Seconds new instances must stay alive before traffic switches to them.
+startup_grace_secs = 2
+# Directory where release artifacts are extracted.
+release_directory = "/var/lib/internalrrd/releases"
+# Maximum artifact size in bytes. Defaults to 512 MiB.
+max_artifact_bytes = 536870912
 
 # Optional environment variables passed to every instance.
 [application.environment]
 RUST_LOG = "info"
+LISTEN_ADDR = "{listen_address}"
+
+[trust]
+# Release signing keys. Ed25519 public keys are 64 hexadecimal characters.
+keys = [
+  { id = "release-2026", algorithm = 1, public_key = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a" },
+]
+
+[proxy]
+# Seconds an idle UDP client session is kept open.
+udp_session_timeout_secs = 30
+
+# Private ports assigned to application instances.
+# When this table is absent, ephemeral ports are used instead.
+[proxy.ports]
+start = 30000
+end = 31000
+
+# Public L4 listeners that forward to the active release.
+# Remove all listener entries to run without a proxy.
+[[proxy.listeners]]
+protocol = "tcp"
+bind = "0.0.0.0"
+port = 8080
+
+[[proxy.listeners]]
+protocol = "udp"
+bind = "0.0.0.0"
+port = 53

@@ -14,6 +14,7 @@ use crate::supervisor::InstanceInfo;
 /// This performs blocking file system reads and should run in a blocking task.
 pub fn collect(
     application_name: &str,
+    deployed_version: Option<String>,
     working_directory: Option<&Path>,
     instances: &[InstanceInfo],
     instance: Option<u64>,
@@ -39,7 +40,7 @@ pub fn collect(
         internalrrd,
         application: Some(ApplicationMetrics {
             name: application_name.to_string(),
-            deployed_version: None,
+            deployed_version,
             aggregate,
             instances: instance_metrics,
         }),
@@ -212,7 +213,7 @@ mod tests {
 
     #[test]
     fn collects_an_application_report() {
-        let report = collect("example", None, &[], None);
+        let report = collect("example", None, None, &[], None);
 
         assert!(report.captured_at_unix > 0);
         let Some(application) = report.application else {

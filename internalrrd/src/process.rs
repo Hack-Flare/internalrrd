@@ -6,7 +6,6 @@ use std::time::{Duration, Instant};
 
 use tokio::process::{Child, Command};
 
-use crate::config::ApplicationConfig;
 use crate::supervisor::InstanceId;
 
 /// Everything needed to spawn one application instance.
@@ -17,18 +16,6 @@ pub struct ProcessSpec {
     pub working_directory: Option<PathBuf>,
     pub environment: BTreeMap<String, String>,
     pub shutdown_timeout: Duration,
-}
-
-impl From<&ApplicationConfig> for ProcessSpec {
-    fn from(config: &ApplicationConfig) -> Self {
-        Self {
-            command: config.command.clone(),
-            args: config.args.clone(),
-            working_directory: config.working_directory.clone(),
-            environment: config.environment.clone(),
-            shutdown_timeout: config.shutdown_timeout(),
-        }
-    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -52,6 +39,7 @@ pub struct ManagedProcess {
     pid: u32,
     child: Child,
     started_at: Instant,
+    shutdown_timeout: Duration,
 }
 
 impl ManagedProcess {
@@ -75,6 +63,7 @@ impl ManagedProcess {
             pid,
             child,
             started_at: Instant::now(),
+            shutdown_timeout: spec.shutdown_timeout,
         })
     }
 
@@ -96,14 +85,14 @@ impl ManagedProcess {
     }
 
     /// Ask the instance to stop, killing it if it exceeds the timeout.
-    pub async fn terminate(&mut self, timeout: Duration) -> Result<(), ProcessError> {
+    pub async fn terminate(&mut self) -> Result<(), ProcessError> {
         if self.try_wait()?.is_some() {
             return Ok(());
         }
 
         self.request_termination()?;
 
-        match tokio::time::timeout(timeout, self.child.wait()).await {
+        match tokio::time::timeout(self.shutdown_timeout, self.child.wait()).await {
             Ok(result) => {
                 result.map_err(ProcessError::Wait)?;
                 Ok(())

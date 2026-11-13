@@ -1,5 +1,11 @@
 pub mod config;
+pub mod deployment;
 pub mod management;
 pub mod metrics;
+pub mod ports;
 pub mod process;
+pub mod proxy;
+pub mod release;
 pub mod supervisor;
+pub mod template;
+pub mod trust;
