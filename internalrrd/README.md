@@ -13,6 +13,7 @@ It currently supports:
 - Verifying artifact SHA-256 checksums.
 - Extracting `tar.gz` releases into versioned directories.
 - Starting multiple instances per release on named private ports.
+- Checking that new instances accept TCP connections before switching traffic.
 - Switching TCP and UDP traffic to a new release without restarting the container.
 - Routing each public listener to a different application port.
 - Gracefully stopping the previous release after the switch.
@@ -45,11 +46,12 @@ A `Deploy` request is processed in this order:
 7. Extract the `tar.gz` artifact into `releases/<version>-<sha12>/`.
 8. Start `application.instances` new processes with a private port for every `application.ports` entry.
 9. Wait for `application.startup_grace_secs` and confirm the new processes are still alive.
-10. Switch the proxy backend map so every listener uses the new instances.
-11. Stop the old instances with `SIGTERM`, then `SIGKILL` after the shutdown timeout.
-12. Release the old private ports and update the `current` release link.
+10. Probe every TCP application port until the new instances accept connections, up to `application.health.timeout_secs`.
+11. Switch the proxy backend map so every listener uses the new instances.
+12. Stop the old instances with `SIGTERM`, then `SIGKILL` after the shutdown timeout.
+13. Release the old private ports and update the `current` release link.
 
-If a new instance exits during the startup grace period, the deployment is rejected, the new instances are stopped, their ports are released, and the old release keeps serving.
+If a new instance exits or fails the readiness check, the deployment is rejected, the new instances are stopped, their ports are released, and the old release keeps serving.
 
 ## L4 proxy
 
@@ -88,6 +90,18 @@ See [`CONFIG.md`](CONFIG.md#template-placeholders) for the complete rules.
 When `application.command` contains `{release_dir}` and no release is installed, `internalrrd` starts no instances and waits for the first deployment.
 After a successful deployment, the `current` symlink lets a restarted `internalrrd` start from the most recent release.
 
+## Health checks
+
+A deployment is only activated after the new instances pass a readiness check.
+New instances must first stay alive for `application.startup_grace_secs`.
+Then `internalrrd` opens a TCP connection to every private port that declares the `tcp` protocol, for every new instance.
+It retries every `application.health.interval_secs` until all probes succeed or `application.health.timeout_secs` expires.
+
+A failed readiness check rejects the deployment with `HealthCheckFailed` and rolls the new instances back.
+Set `application.health.enabled = false` to accept a deployment based on process liveness alone.
+
+Applications that only declare `udp` ports have no TCP endpoint to probe, so their deployments only check process liveness.
+
 ## Release directory layout
 
 The `application.release_directory` contains:
@@ -118,7 +132,7 @@ Storage usage is read from the filesystem that contains the release directory.
 
 ## Limitations
 
-- Health checks use process liveness during the startup grace period, not application-level readiness.
+- Readiness probes open TCP connections to declared `tcp` ports. UDP-only applications are checked for process liveness only.
 - Traffic counters remain at zero until request instrumentation is added.
 - UDP sessions that are already open stay on the old release until they idle out.
 - Artifact URLs support `http://`, `https://`, and `file://`.

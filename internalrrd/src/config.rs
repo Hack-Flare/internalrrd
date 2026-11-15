@@ -13,6 +13,12 @@ pub use protocol::DEFAULT_MANAGEMENT_PORT;
 pub const DEFAULT_INSTANCES: u8 = 1;
 /// How long new instances must stay alive before traffic is switched to them.
 pub const DEFAULT_STARTUP_GRACE_SECS: u64 = 2;
+/// Whether new instances must accept TCP connections before traffic switches to them.
+pub const DEFAULT_HEALTH_ENABLED: bool = true;
+/// How long to wait between application readiness probes.
+pub const DEFAULT_HEALTH_INTERVAL_SECS: u64 = 1;
+/// How long a new instance has to pass the application readiness check.
+pub const DEFAULT_HEALTH_TIMEOUT_SECS: u64 = 30;
 /// The default directory where release artifacts are extracted.
 pub const DEFAULT_RELEASE_DIRECTORY: &str = "/var/lib/internalrrd/releases";
 /// The default maximum artifact size that will be downloaded.
@@ -39,6 +45,18 @@ fn default_instances() -> u8 {
 
 fn default_startup_grace_secs() -> u64 {
     DEFAULT_STARTUP_GRACE_SECS
+}
+
+fn default_health_enabled() -> bool {
+    DEFAULT_HEALTH_ENABLED
+}
+
+fn default_health_interval_secs() -> u64 {
+    DEFAULT_HEALTH_INTERVAL_SECS
+}
+
+fn default_health_timeout_secs() -> u64 {
+    DEFAULT_HEALTH_TIMEOUT_SECS
 }
 
 fn default_release_directory() -> PathBuf {
@@ -120,6 +138,9 @@ pub struct ApplicationConfig {
     /// How long a new instance must stay alive before it receives traffic.
     #[serde(default = "default_startup_grace_secs")]
     pub startup_grace_secs: u64,
+    /// How new instances are checked for application readiness.
+    #[serde(default)]
+    pub health: ApplicationHealthConfig,
     /// The directory where release artifacts are extracted.
     #[serde(default = "default_release_directory")]
     pub release_directory: PathBuf,
@@ -131,6 +152,31 @@ pub struct ApplicationConfig {
     /// When empty, a single port named `default` is allocated per instance.
     #[serde(default)]
     pub ports: Vec<ApplicationPortConfig>,
+}
+
+/// Readiness checks applied to new instances before traffic is switched to them.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApplicationHealthConfig {
+    /// Whether instances must accept TCP connections on every TCP application port.
+    #[serde(default = "default_health_enabled")]
+    pub enabled: bool,
+    /// How long to wait between readiness probes.
+    #[serde(default = "default_health_interval_secs")]
+    pub interval_secs: u64,
+    /// How long a new instance has to pass the readiness check.
+    #[serde(default = "default_health_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+impl Default for ApplicationHealthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_health_enabled(),
+            interval_secs: default_health_interval_secs(),
+            timeout_secs: default_health_timeout_secs(),
+        }
+    }
 }
 
 /// One named private port that application instances listen on.
@@ -176,6 +222,16 @@ impl ApplicationConfig {
     /// The startup grace period as a duration.
     pub fn startup_grace(&self) -> Duration {
         Duration::from_secs(self.startup_grace_secs)
+    }
+
+    /// The delay between application readiness probes as a duration.
+    pub fn health_interval(&self) -> Duration {
+        Duration::from_secs(self.health.interval_secs)
+    }
+
+    /// The application readiness timeout as a duration.
+    pub fn health_timeout(&self) -> Duration {
+        Duration::from_secs(self.health.timeout_secs)
     }
 }
 
@@ -301,6 +357,16 @@ impl Config {
         if self.application.instances == 0 {
             return Err(ConfigError::Invalid(
                 "application.instances must be greater than zero".to_string(),
+            ));
+        }
+        if self.application.health.interval_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "application.health.interval_secs must be greater than zero".to_string(),
+            ));
+        }
+        if self.application.health.timeout_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "application.health.timeout_secs must be greater than zero".to_string(),
             ));
         }
         if self.application.release_directory.as_os_str().is_empty() {
@@ -482,6 +548,7 @@ mod tests {
                 shutdown_timeout_secs: default_shutdown_timeout_secs(),
                 instances: default_instances(),
                 startup_grace_secs: default_startup_grace_secs(),
+                health: ApplicationHealthConfig::default(),
                 release_directory: default_release_directory(),
                 max_artifact_bytes: default_max_artifact_bytes(),
                 ports: Vec::new(),
@@ -510,6 +577,15 @@ mod tests {
         assert_eq!(
             config.application.startup_grace_secs,
             DEFAULT_STARTUP_GRACE_SECS
+        );
+        assert!(config.application.health.enabled);
+        assert_eq!(
+            config.application.health.interval_secs,
+            DEFAULT_HEALTH_INTERVAL_SECS
+        );
+        assert_eq!(
+            config.application.health.timeout_secs,
+            DEFAULT_HEALTH_TIMEOUT_SECS
         );
         assert_eq!(
             config.application.release_directory,
@@ -545,6 +621,9 @@ mod tests {
             shutdown_timeout_secs = 5
             instances = 3
             startup_grace_secs = 7
+            health.enabled = false
+            health.interval_secs = 3
+            health.timeout_secs = 11
             release_directory = "/srv/releases"
             max_artifact_bytes = 1024
 
@@ -573,6 +652,11 @@ mod tests {
         assert_eq!(config.application.shutdown_timeout().as_secs(), 5);
         assert_eq!(config.application.instances, 3);
         assert_eq!(config.application.startup_grace_secs, 7);
+        assert!(!config.application.health.enabled);
+        assert_eq!(config.application.health.interval_secs, 3);
+        assert_eq!(config.application.health.timeout_secs, 11);
+        assert_eq!(config.application.health_interval().as_secs(), 3);
+        assert_eq!(config.application.health_timeout().as_secs(), 11);
         assert_eq!(
             config.application.release_directory,
             PathBuf::from("/srv/releases")
@@ -659,6 +743,22 @@ mod tests {
     fn rejects_zero_instances() {
         let mut config = minimal_config();
         config.application.instances = 0;
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_health_interval() {
+        let mut config = minimal_config();
+        config.application.health.interval_secs = 0;
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_health_timeout() {
+        let mut config = minimal_config();
+        config.application.health.timeout_secs = 0;
 
         assert!(config.validate().is_err());
     }

@@ -29,6 +29,12 @@ release_directory = "/var/lib/internalrrd/releases"
 # Maximum artifact size in bytes. Defaults to 512 MiB.
 max_artifact_bytes = 536870912
 
+# A deployment only switches traffic after new instances accept TCP connections.
+[application.health]
+enabled = true
+interval_secs = 1
+timeout_secs = 30
+
 # Optional environment variables passed to every instance.
 [application.environment]
 RUST_LOG = "info"

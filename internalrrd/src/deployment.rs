@@ -2,11 +2,12 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use protocol::{DeploymentAccepted, DeploymentRejected, Outcome, RejectionCode, SignedDeployment};
 use tokio::sync::Mutex;
 
-use crate::config::ApplicationConfig;
+use crate::config::{ApplicationConfig, ProxyProtocol};
 use crate::ports::{PortAllocator, PortError};
 use crate::process::ProcessSpec;
 use crate::proxy::{BackendSet, Proxy};
@@ -19,6 +20,7 @@ use crate::trust::TrustStore;
 pub struct Deployment {
     application: ApplicationConfig,
     port_names: Vec<String>,
+    tcp_port_names: Vec<String>,
     trust: TrustStore,
     releases: ReleaseManager,
     proxy: Option<Arc<Proxy>>,
@@ -51,15 +53,21 @@ impl Deployment {
         ports: PortAllocator,
         supervisor: Arc<Mutex<Supervisor>>,
     ) -> Self {
-        let port_names = application
-            .port_specs()
-            .into_iter()
+        let port_specs = application.port_specs();
+        let port_names = port_specs
+            .iter()
+            .map(|(name, _)| name.to_string())
+            .collect();
+        let tcp_port_names = port_specs
+            .iter()
+            .filter(|(_, protocols)| protocols.contains(&ProxyProtocol::Tcp))
             .map(|(name, _)| name.to_string())
             .collect();
 
         Self {
             application,
             port_names,
+            tcp_port_names,
             trust,
             releases,
             proxy,
@@ -318,8 +326,44 @@ impl Deployment {
     }
 
     async fn wait_until_healthy(&self, instances: &[ActiveInstance]) -> Result<(), String> {
-        tokio::time::sleep(self.application.startup_grace()).await;
+        let interval = self.application.health_interval();
+        let grace_deadline = tokio::time::Instant::now() + self.application.startup_grace();
 
+        loop {
+            self.ensure_running(instances).await?;
+            let now = tokio::time::Instant::now();
+            if now >= grace_deadline {
+                break;
+            }
+            tokio::time::sleep(interval.min(grace_deadline - now)).await;
+        }
+
+        if !self.application.health.enabled || self.tcp_port_names.is_empty() {
+            return Ok(());
+        }
+
+        let deadline = tokio::time::Instant::now() + self.application.health_timeout();
+        loop {
+            self.ensure_running(instances).await?;
+
+            let failures = self.unready_ports(instances).await;
+            if failures.is_empty() {
+                return Ok(());
+            }
+
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(format!(
+                    "application readiness check failed: {}",
+                    failures.join("; ")
+                ));
+            }
+            tokio::time::sleep(interval.min(deadline - now)).await;
+        }
+    }
+
+    /// Fail when an instance exits before the new release receives traffic.
+    async fn ensure_running(&self, instances: &[ActiveInstance]) -> Result<(), String> {
         let mut supervisor = self.supervisor.lock().await;
         supervisor.poll().map_err(|error| error.to_string())?;
 
@@ -329,11 +373,32 @@ impl Deployment {
             .count();
         if exited > 0 {
             return Err(format!(
-                "{exited} new instance(s) exited during the startup grace period"
+                "{exited} new instance(s) exited before the deployment was activated"
             ));
         }
 
         Ok(())
+    }
+
+    /// Probe every TCP application port of every new instance.
+    async fn unready_ports(&self, instances: &[ActiveInstance]) -> Vec<String> {
+        let mut failures = Vec::new();
+
+        for instance in instances {
+            for name in &self.tcp_port_names {
+                let Some(port) = instance.ports.get(name) else {
+                    continue;
+                };
+                if !tcp_port_ready(*port).await {
+                    failures.push(format!(
+                        "instance {} did not accept TCP connections on port '{}' (127.0.0.1:{port})",
+                        instance.id, name
+                    ));
+                }
+            }
+        }
+
+        failures
     }
 
     async fn rollback(
@@ -397,6 +462,22 @@ impl Deployment {
     }
 }
 
+/// How long a single TCP readiness probe may take.
+const READINESS_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// A port is ready when it accepts a TCP connection.
+async fn tcp_port_ready(port: u16) -> bool {
+    let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+    matches!(
+        tokio::time::timeout(
+            READINESS_PROBE_TIMEOUT,
+            tokio::net::TcpStream::connect(address)
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
 fn backend_addresses(instances: &[ActiveInstance], port_names: &[String]) -> BackendSet {
     let mut backends = BackendSet::new();
     for name in port_names {
@@ -443,7 +524,9 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
-    use crate::config::{ApplicationPortConfig, ProxyProtocol, TrustConfig};
+    use crate::config::{
+        ApplicationHealthConfig, ApplicationPortConfig, ProxyProtocol, TrustConfig,
+    };
 
     const KEY_ID: &str = "release-2026";
 
@@ -484,6 +567,10 @@ mod tests {
             shutdown_timeout_secs: 1,
             instances: 2,
             startup_grace_secs: 0,
+            health: ApplicationHealthConfig {
+                enabled: false,
+                ..ApplicationHealthConfig::default()
+            },
             release_directory: directory.join("releases"),
             max_artifact_bytes: 1024 * 1024,
             ports: vec![
@@ -645,6 +732,59 @@ mod tests {
                 ..
             })
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_deployments_that_never_become_ready() -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::tempdir()?;
+        let (archive, digest, size) = create_artifact(temporary.path())?;
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let mut application = application(temporary.path());
+        application.health = ApplicationHealthConfig {
+            enabled: true,
+            interval_secs: 1,
+            timeout_secs: 1,
+        };
+
+        let supervisor = Arc::new(Mutex::new(Supervisor::new()));
+        let deployment = Deployment::new(
+            application,
+            trust(&signing_key),
+            ReleaseManager::new(temporary.path().join("releases"), 1024 * 1024)?,
+            None,
+            PortAllocator::new(None, []),
+            supervisor.clone(),
+        );
+
+        let outcome = deployment
+            .deploy(signed(
+                &signing_key,
+                &archive,
+                digest,
+                size,
+                "1.2.3",
+                1_700_000_000,
+            ))
+            .await;
+
+        assert!(matches!(
+            outcome,
+            Outcome::DeploymentRejected(DeploymentRejected {
+                code: RejectionCode::HEALTH_CHECK_FAILED,
+                ..
+            })
+        ));
+        assert!(supervisor.lock().await.running().is_empty());
+        assert!(deployment.current_version().await.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn readiness_probe_connects_to_a_listening_port() -> Result<(), Box<dyn Error>> {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let port = listener.local_addr()?.port();
+        assert!(tcp_port_ready(port).await);
         Ok(())
     }
 }

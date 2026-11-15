@@ -511,6 +511,10 @@ mod tests {
             shutdown_timeout_secs: 1,
             instances: 1,
             startup_grace_secs: 0,
+            health: crate::config::ApplicationHealthConfig {
+                enabled: false,
+                ..crate::config::ApplicationHealthConfig::default()
+            },
             release_directory: temporary.path().join("releases"),
             max_artifact_bytes: 1024 * 1024,
             ports: Vec::new(),

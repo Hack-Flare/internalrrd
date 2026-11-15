@@ -51,6 +51,7 @@ Port `54` is below 1024, so binding it may require root or `CAP_NET_BIND_SERVICE
 | `shutdown_timeout_secs` | integer           | `30`                           | Seconds an instance has to exit after `SIGTERM` before `SIGKILL`.   |
 | `instances`             | integer           | `1`                            | Number of instances started for each release.                      |
 | `startup_grace_secs`    | integer           | `2`                            | Seconds new instances must stay alive before they receive traffic. |
+| `health`                | table             | enabled                        | Application readiness checks applied before traffic switches.      |
 | `release_directory`     | string (path)     | `/var/lib/internalrrd/releases`| Directory that stores downloads and extracted releases.            |
 | `max_artifact_bytes`    | integer           | `536870912` (512 MiB)          | Maximum downloaded artifact size.                                  |
 | `ports`                 | array of tables   | `[]`                           | Named private ports assigned to every instance.                    |
@@ -108,6 +109,29 @@ DNS_LISTEN_ADDR = "{listen_address:dns}"
 ```
 
 When `application.ports` is empty, use `{listen_address}` instead of a named form.
+
+### `application.health`
+
+Readiness checks run after `application.startup_grace_secs` and before traffic switches to a new release.
+`internalrrd` opens a TCP connection to every application port that declares the `tcp` protocol, for every new instance.
+A probe succeeds when the connection is accepted within one second.
+The deployment is rejected with `HealthCheckFailed` when a probe still fails at the timeout.
+
+| Key             | Type    | Default | Description                                                  |
+| --------------- | ------- | ------- | ------------------------------------------------------------ |
+| `enabled`       | boolean | `true`  | Whether new instances must accept TCP connections.           |
+| `interval_secs` | integer | `1`     | Seconds between probe rounds.                                |
+| `timeout_secs`  | integer | `30`    | Seconds a new instance has to pass the readiness check.      |
+
+A deployment of an application with only `udp` ports cannot be probed over TCP, so it only checks process liveness.
+Set `enabled = false` to skip readiness probes entirely.
+
+```toml
+[application.health]
+enabled = true
+interval_secs = 1
+timeout_secs = 30
+```
 
 ## `trust`
 
@@ -323,18 +347,20 @@ A deployment replaces all instances of a release as a blue-green switch:
 4. It allocates every named private port for `application.instances` new instances.
 5. It starts the new instances with templates expanded for their private ports.
 6. It waits `startup_grace_secs` and confirms the new processes are still alive.
-7. It replaces the proxy backend map in one step, so every listener switches to the new set together.
-8. It sends `SIGTERM` to the old instances and waits up to `shutdown_timeout_secs` before `SIGKILL`.
-9. It releases the old private ports and updates the `current` symlink.
+7. It probes every `tcp` application port until the new instances accept connections or `application.health.timeout_secs` expires.
+8. It replaces the proxy backend map in one step, so every listener switches to the new set together.
+9. It sends `SIGTERM` to the old instances and waits up to `shutdown_timeout_secs` before `SIGKILL`.
+10. It releases the old private ports and updates the `current` symlink.
 
-If anything fails before step 7, the new instances are stopped, their ports are released, and the old release keeps serving.
+If anything fails before step 8, the new instances are stopped, their ports are released, and the old release keeps serving.
 
 New TCP connections use the new release immediately after the switch.
 Connections that were already open continue to the old instance until they close or the old instance exits.
 Open UDP sessions keep their old backend until they idle out or the old instance exits.
 
-The health check is process liveness, not application readiness.
-Set `startup_grace_secs` high enough for the application to bind every private port.
+Readiness probes require the application to accept TCP connections on every port that declares the `tcp` protocol.
+Set `startup_grace_secs` and `application.health.timeout_secs` high enough for the application to bind every private port.
+UDP-only applications fall back to process liveness.
 
 ## Common configuration errors
 
@@ -347,6 +373,7 @@ Set `startup_grace_secs` high enough for the application to bind every private p
 | `range includes the management port`                           | `proxy.ports` overlaps `management.port`.                      |
 | `range includes listener port`                                 | `proxy.ports` overlaps a public listener port.                 |
 | `no free application ports remain`                             | The range is too small for old and new instances together.     |
+| `application readiness check failed`                            | A new instance did not accept TCP connections before the timeout. |
 | `template references unknown application port`                 | A template uses a name that is not in `application.ports`.     |
 | `template requires {release_dir} but no release is installed`  | A template uses `{release_dir}` before a release is available. |
 
@@ -356,6 +383,7 @@ Set `startup_grace_secs` high enough for the application to bind every private p
 
 - `application.name` or `application.command` is empty.
 - `application.shutdown_timeout_secs`, `application.instances`, or `application.max_artifact_bytes` is zero.
+- `application.health.interval_secs` or `application.health.timeout_secs` is zero.
 - `application.release_directory` is empty.
 - An application port name is empty, duplicated, or has no protocols.
 - An application port repeats a protocol.
