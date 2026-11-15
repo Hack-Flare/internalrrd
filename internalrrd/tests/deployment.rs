@@ -7,7 +7,7 @@ use internalrrd::config::{
     ApplicationConfig, ApplicationHealthConfig, ApplicationPortConfig, ProxyProtocol, TrustConfig,
     TrustedKeyConfig,
 };
-use internalrrd::deployment::Deployment;
+use internalrrd::deployment::{Deployment, DeploymentError};
 use internalrrd::ports::PortAllocator;
 use internalrrd::release::ReleaseManager;
 use internalrrd::supervisor::Supervisor;
@@ -54,6 +54,26 @@ fn application(directory: &Path) -> ApplicationConfig {
                 protocols: vec![ProxyProtocol::Tcp],
             },
         ],
+    }
+}
+
+fn running_application(directory: &Path, health: ApplicationHealthConfig) -> ApplicationConfig {
+    ApplicationConfig {
+        name: "example".to_string(),
+        command: PathBuf::from("sh"),
+        args: vec!["-c".to_string(), "sleep 30".to_string()],
+        working_directory: None,
+        environment: BTreeMap::new(),
+        shutdown_timeout_secs: 1,
+        instances: 1,
+        startup_grace_secs: 0,
+        health,
+        release_directory: directory.join("releases"),
+        max_artifact_bytes: 1024 * 1024,
+        ports: vec![ApplicationPortConfig {
+            name: "http".to_string(),
+            protocols: vec![ProxyProtocol::Tcp],
+        }],
     }
 }
 
@@ -249,6 +269,66 @@ async fn rejects_deployments_that_never_become_ready() -> Result<(), Box<dyn Err
             ..
         })
     ));
+    assert!(supervisor.lock().await.running().is_empty());
+    assert!(deployment.current_version().await.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn starts_instances_from_the_configuration() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let signing_key = SigningKey::from_bytes(&[7; 32]);
+    let supervisor = Arc::new(Mutex::new(Supervisor::new()));
+    let deployment = Deployment::new(
+        running_application(
+            temporary.path(),
+            ApplicationHealthConfig {
+                enabled: false,
+                ..ApplicationHealthConfig::default()
+            },
+        ),
+        trust(&signing_key),
+        ReleaseManager::new(temporary.path().join("releases"), 1024 * 1024)?,
+        None,
+        PortAllocator::new(None, []),
+        supervisor.clone(),
+    );
+
+    deployment.start_initial().await?;
+
+    assert_eq!(supervisor.lock().await.running().len(), 1);
+    assert!(deployment.current_version().await.is_none());
+    supervisor.lock().await.stop_all().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_unready_instances_at_startup() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let signing_key = SigningKey::from_bytes(&[7; 32]);
+    let supervisor = Arc::new(Mutex::new(Supervisor::new()));
+    let deployment = Deployment::new(
+        running_application(
+            temporary.path(),
+            ApplicationHealthConfig {
+                enabled: true,
+                interval_secs: 1,
+                timeout_secs: 1,
+            },
+        ),
+        trust(&signing_key),
+        ReleaseManager::new(temporary.path().join("releases"), 1024 * 1024)?,
+        None,
+        PortAllocator::new(None, []),
+        supervisor.clone(),
+    );
+
+    let error = deployment
+        .start_initial()
+        .await
+        .expect_err("startup should fail readiness");
+
+    assert!(matches!(error, DeploymentError::NotReady(_)));
     assert!(supervisor.lock().await.running().is_empty());
     assert!(deployment.current_version().await.is_none());
     Ok(())

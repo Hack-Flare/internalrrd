@@ -112,10 +112,11 @@ When `application.ports` is empty, use `{listen_address}` instead of a named for
 
 ### `application.health`
 
-Readiness checks run after `application.startup_grace_secs` and before traffic switches to a new release.
+Readiness checks run after `application.startup_grace_secs` and before traffic switches to new instances, both at startup and during a deployment.
 `internalrrd` opens a TCP connection to every application port that declares the `tcp` protocol, for every new instance.
 A probe succeeds when the connection is accepted within one second.
 The deployment is rejected with `HealthCheckFailed` when a probe still fails at the timeout.
+A failed startup check stops the new instances and exits `internalrrd`.
 
 | Key             | Type    | Default | Description                                                  |
 | --------------- | ------- | ------- | ------------------------------------------------------------ |
@@ -123,7 +124,7 @@ The deployment is rejected with `HealthCheckFailed` when a probe still fails at 
 | `interval_secs` | integer | `1`     | Seconds between probe rounds.                                |
 | `timeout_secs`  | integer | `30`    | Seconds a new instance has to pass the readiness check.      |
 
-A deployment of an application with only `udp` ports cannot be probed over TCP, so it only checks process liveness.
+An application with only `udp` ports cannot be probed over TCP, so startup and deployment only check process liveness.
 Set `enabled = false` to skip readiness probes entirely.
 
 ```toml
@@ -374,6 +375,7 @@ UDP-only applications fall back to process liveness.
 | `range includes listener port`                                 | `proxy.ports` overlaps a public listener port.                 |
 | `no free application ports remain`                             | The range is too small for old and new instances together.     |
 | `application readiness check failed`                            | A new instance did not accept TCP connections before the timeout. |
+| `new instances did not become ready`                           | Startup readiness failed and `internalrrd` stopped the instances. |
 | `template references unknown application port`                 | A template uses a name that is not in `application.ports`.     |
 | `template requires {release_dir} but no release is installed`  | A template uses `{release_dir}` before a release is available. |
 

@@ -81,7 +81,8 @@ impl Deployment {
     /// Start instances from the current release, if one is available.
     ///
     /// When the command requires `{release_dir}` + no release is installed, no instances are started.
-    /// Server waits for first deployment in this case
+    /// Server waits for first deployment in this case.
+    /// New instances must pass the configured readiness checks before the proxy uses them.
     pub async fn start_initial(&self) -> Result<(), DeploymentError> {
         let release = self.releases.current().await;
         let command_template = self.application.command.to_string_lossy();
@@ -131,6 +132,11 @@ impl Deployment {
                     return Err(error.into());
                 }
             }
+        }
+
+        if let Err(error) = self.wait_until_healthy(&instances).await {
+            self.rollback(&mut instances, &mut allocations).await;
+            return Err(DeploymentError::NotReady(error));
         }
 
         if let Some(proxy) = &self.proxy {
@@ -243,7 +249,10 @@ impl Deployment {
         if let Err(error) = self.wait_until_healthy(&new_instances).await {
             self.rollback(&mut new_instances, &mut new_allocations)
                 .await;
-            return Err(reject(RejectionCode::HEALTH_CHECK_FAILED, error));
+            return Err(reject(
+                RejectionCode::HEALTH_CHECK_FAILED,
+                format!("application readiness check failed: {error}"),
+            ));
         }
 
         if let Some(proxy) = &self.proxy {
@@ -354,7 +363,7 @@ impl Deployment {
             let now = tokio::time::Instant::now();
             if now >= deadline {
                 return Err(format!(
-                    "application readiness check failed: {}",
+                    "instances did not accept TCP connections: {}",
                     failures.join("; ")
                 ));
             }
@@ -373,7 +382,7 @@ impl Deployment {
             .count();
         if exited > 0 {
             return Err(format!(
-                "{exited} new instance(s) exited before the deployment was activated"
+                "{exited} new instance(s) exited before becoming ready"
             ));
         }
 
@@ -509,4 +518,6 @@ pub enum DeploymentError {
     Supervisor(#[from] SupervisorError),
     #[error("application command template expanded to an empty command")]
     EmptyCommand,
+    #[error("new instances did not become ready: {0}")]
+    NotReady(String),
 }

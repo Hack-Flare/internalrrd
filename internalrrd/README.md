@@ -93,14 +93,16 @@ After a successful deployment, the `current` symlink lets a restarted `internalr
 ## Health checks
 
 A deployment is only activated after the new instances pass a readiness check.
+New instances are also checked at startup before the proxy sends them traffic.
 New instances must first stay alive for `application.startup_grace_secs`.
 Then `internalrrd` opens a TCP connection to every private port that declares the `tcp` protocol, for every new instance.
 It retries every `application.health.interval_secs` until all probes succeed or `application.health.timeout_secs` expires.
 
 A failed readiness check rejects the deployment with `HealthCheckFailed` and rolls the new instances back.
-Set `application.health.enabled = false` to accept a deployment based on process liveness alone.
+At startup, a failed check stops the new instances and exits `internalrrd`.
+Set `application.health.enabled = false` to accept instances based on process liveness alone.
 
-Applications that only declare `udp` ports have no TCP endpoint to probe, so their deployments only check process liveness.
+Applications that only declare `udp` ports have no TCP endpoint to probe, so startup and deployments only check process liveness.
 
 ## Release directory layout
 
