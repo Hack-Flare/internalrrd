@@ -1,0 +1,28 @@
+# InternalRRD console configuration.
+#
+# The console signs deployments with an Ed25519 key and sends them to the servers listed below.
+# Keep this file secret
+
+[application]
+# The application name that deployments target. Must match every server
+name = "example"
+
+[signing]
+# The key identifier in each server's trust store.
+key_id = "release-2026"
+# A 32-byte Ed25519 private key as 64 hexadecimal characters.
+# CHANGETHIS!
+private_key = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
+
+[network]
+# Seconds a connection or response may take.
+timeout_secs = 10
+
+# Servers are deployed to in configuration order.
+[[servers]]
+name = "web-1"
+address = "127.0.0.1:54"
+
+[[servers]]
+name = "web-2"
+address = "127.0.0.1:1054"
